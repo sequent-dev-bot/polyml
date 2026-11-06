@@ -46,6 +46,7 @@
 #include "statistics.h"
 #include "processes.h"
 #include "machine_dep.h"
+#include "heapsizing.h"
 
 
 #ifdef POLYML32IN64
@@ -133,6 +134,7 @@ MemMgr::MemMgr(): allocLock("Memmgr alloc"), codeBitmapLock("Code bitmap")
     spaceBeforeMinorGC = 0;
     spaceForHeap = 0;
     currentAllocSpace = currentHeapSize = 0;
+    stackSpaceTotal = 0;
     defaultSpaceSize = 1024 * 1024 / sizeof(PolyWord); // 1Mbyte segments.
     spaceTree = new SpaceTreeTree;
 }
@@ -978,9 +980,23 @@ uintptr_t MemMgr::GetFreeAllocSpace()
     return freeSpace;
 }
 
+bool MemMgr::StackSpaceAvailable(uintptr_t words)
+{
+    uintptr_t limit = gHeapSizeParameters.MaxStackSize();
+    return stackSpaceTotal <= limit && words <= limit - stackSpaceTotal;
+}
+
 StackSpace *MemMgr::NewStackSpace(uintptr_t size)
 {
     PLocker lock(&stackSpaceLock);
+
+    // Always allow the initial thread's stack.
+    if (! sSpaces.empty() && ! StackSpaceAvailable(size))
+    {
+        if (debugOptions & DEBUG_MEMMGR)
+            Log("MMGR: New stack space: stack limit reached\n");
+        return 0;
+    }
 
     try {
         StackSpace *space = new StackSpace(&osStackAlloc);
@@ -1013,6 +1029,7 @@ StackSpace *MemMgr::NewStackSpace(uintptr_t size)
             delete space;
             return 0;
         }
+        stackSpaceTotal += size;
         if (debugOptions & DEBUG_MEMMGR)
             Log("MMGR: New stack space %p allocated at %p size %lu\n", space, space->bottom, space->spaceSize());
         globalStats.incSize(PSS_STACK_SPACE, space->spaceSize() * sizeof(PolyWord));
@@ -1045,6 +1062,21 @@ void MemMgr::ProtectImmutable(bool on)
 bool MemMgr::GrowOrShrinkStack(TaskData *taskData, uintptr_t newSize)
 {
     StackSpace *space = taskData->stack;
+    uintptr_t currentSize = space->spaceSize();
+    // Reserve any growth against the limit.  Both stacks exist during the copy
+    // but only the growth is counted.
+    uintptr_t growth = newSize > currentSize ? newSize - currentSize : 0;
+    {
+        PLocker lock(&stackSpaceLock);
+        if (! StackSpaceAvailable(growth))
+        {
+            if (debugOptions & DEBUG_MEMMGR)
+                Log("MMGR: Unable to change size of stack %p from %lu to %lu: stack limit reached\n",
+                    space, currentSize, newSize);
+            return false;
+        }
+        stackSpaceTotal += growth;
+    }
     size_t iSpace = newSize*sizeof(PolyWord);
 
     PolyWord *newSpace = (PolyWord*)osStackAlloc.AllocateDataArea(iSpace);
@@ -1053,6 +1085,8 @@ bool MemMgr::GrowOrShrinkStack(TaskData *taskData, uintptr_t newSize)
         if (debugOptions & DEBUG_MEMMGR)
             Log("MMGR: Unable to change size of stack %p from %lu to %lu: insufficient space\n",
                 space, space->spaceSize(), newSize);
+        PLocker lock(&stackSpaceLock);
+        stackSpaceTotal -= growth;
         return false;
     }
     // The size may have been rounded up to a block boundary.
@@ -1062,8 +1096,10 @@ bool MemMgr::GrowOrShrinkStack(TaskData *taskData, uintptr_t newSize)
     }
     catch (std::bad_alloc&) {
         RemoveTree(space, newSpace, newSpace+newSize);
-        delete space;
-        return 0;
+        osStackAlloc.FreeDataArea(newSpace, iSpace);
+        PLocker lock(&stackSpaceLock);
+        stackSpaceTotal -= growth;
+        return false;
     }
     taskData->CopyStackFrame(space->stack(), space->spaceSize(), (StackObject*)newSpace, newSize);
     if (debugOptions & DEBUG_MEMMGR)
@@ -1075,6 +1111,10 @@ bool MemMgr::GrowOrShrinkStack(TaskData *taskData, uintptr_t newSize)
     space->bottom = newSpace; // Switch this before freeing - We could get a profile trap during the free
     space->top = newSpace+newSize;
     osStackAlloc.FreeDataArea(oldBottom, oldSize);
+    // Replace the reservation with the actual change, which includes any rounding.
+    PLocker lock(&stackSpaceLock);
+    stackSpaceTotal += newSize;
+    stackSpaceTotal -= currentSize + growth;
     return true;
 }
 
@@ -1090,6 +1130,7 @@ bool MemMgr::DeleteStackSpace(StackSpace *space)
         if (*i == space)
         {
             globalStats.decSize(PSS_STACK_SPACE, space->spaceSize() * sizeof(PolyWord));
+            stackSpaceTotal -= space->spaceSize();
             RemoveTree(space);
             delete space;
             sSpaces.erase(i);

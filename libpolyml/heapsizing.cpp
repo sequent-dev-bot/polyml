@@ -106,6 +106,7 @@ HeapSizeParameters::HeapSizeParameters()
     allocationFailedBeforeLastMajorGC = false;
     minHeapSize = 0;
     maxHeapSize = 0; // Unlimited
+    maxStackSize = 0; // Set by SetHeapParameters
     lastFreeSpace = 0;
     pagingLimitSize = 0;
     highWaterMark = 0;
@@ -142,6 +143,8 @@ void HeapSizeParameters::SetHeapParameters(uintptr_t minsize, uintptr_t maxsize,
     minHeapSize = K_to_words(minsize); // If these overflow assume the result will be zero
     maxHeapSize = K_to_words(maxsize);
     uintptr_t initialSize = K_to_words(initialsize);
+
+    maxStackSize = maxHeapSize != 0 && maxHeapSize <= MAXIMUMADDRESS ? maxHeapSize : MAXIMUMADDRESS;
 
     uintptr_t memsize = GetPhysicalMemorySize() / sizeof(PolyWord);
 
