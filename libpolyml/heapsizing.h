@@ -34,7 +34,7 @@ public:
     Handle getGCUtime(TaskData *taskData) const;
     Handle getGCStime(TaskData *taskData) const;
 
-    void SetHeapParameters(uintptr_t minsize, uintptr_t maxsize, uintptr_t initialsize, unsigned percent);
+    void SetHeapParameters(uintptr_t minsize, uintptr_t maxsize, uintptr_t initialsize, unsigned percent, bool gcsh);
 
     void SetReservation(uintptr_t rsize);
 
@@ -47,6 +47,8 @@ public:
     LocalMemSpace *AddSpaceBeforeCopyPhase(bool isMutable);
 
     bool PerformSharingPass() const { return performSharingPass; }
+    // The limit on the total size of the thread stacks in words.
+    uintptr_t MaxStackSize() const { return maxStackSize; }
     void AdjustSizeAfterMajorGC(uintptr_t wordsRequired);
     bool AdjustSizeAfterMinorGC(uintptr_t spaceAfterGC, uintptr_t spaceBeforeGC);
 
@@ -82,6 +84,8 @@ private:
     // Set if we should do a full GC next time instead of a minor GC.
     bool fullGCNextTime;
 
+    // Whether to ever allow the GC sharing pass
+    bool allowGCSharing;
     // Whether a sharing pass should be performed on the next GC
     bool performSharingPass;
     // The proportion of the total heap recovered by the sharing pass
@@ -95,6 +99,9 @@ private:
 
     // Maximum and minimum heap size as given by the user.
     uintptr_t minHeapSize, maxHeapSize;
+    // The limit on the total size of the stacks: the maximum heap size if one
+    // was given, as a budget separate from the heap's, otherwise unlimited.
+    uintptr_t maxStackSize;
 
     // Target GC cost requested by the user.
     double userGCRatio;

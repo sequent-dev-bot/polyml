@@ -1,7 +1,7 @@
 /*
     Title:  heapsizing.cpp - parameters to adjust heap size
 
-    Copyright (c) Copyright David C.J. Matthews 2012, 2015, 2017, 2023
+    Copyright (c) Copyright David C.J. Matthews 2012, 2015, 2017, 2023, 2026
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -106,6 +106,7 @@ HeapSizeParameters::HeapSizeParameters()
     allocationFailedBeforeLastMajorGC = false;
     minHeapSize = 0;
     maxHeapSize = 0; // Unlimited
+    maxStackSize = 0; // Set by SetHeapParameters
     lastFreeSpace = 0;
     pagingLimitSize = 0;
     highWaterMark = 0;
@@ -114,6 +115,12 @@ HeapSizeParameters::HeapSizeParameters()
     // Initial values until we've actually done a sharing pass.
     sharingRecoveryRate = 0.5; // The structure sharing recovers half the heap.
     sharingCostFactor = 2; // It doubles the cost
+    allowGCSharing = false;
+    currentSpaceUsed = 0;
+    heapSizeAtStart = 0;
+    lastMajorGCRatio = 0;
+    majorGCPageFaults = minorGCPageFaults = minorGCsSinceMajor = 0;
+    predictedRatio = userGCRatio = 0;
 }
 
 // These macros were originally in globals.h and used more generally.
@@ -137,11 +144,13 @@ static size_t GetPhysicalMemorySize(void);
 
 // Set the initial size based on any parameters specified on the command line.
 // Any of these can be zero indicating they should default.
-void HeapSizeParameters::SetHeapParameters(uintptr_t minsize, uintptr_t maxsize, uintptr_t initialsize, unsigned percent)
+void HeapSizeParameters::SetHeapParameters(uintptr_t minsize, uintptr_t maxsize, uintptr_t initialsize, unsigned percent, bool gcshare)
 {
     minHeapSize = K_to_words(minsize); // If these overflow assume the result will be zero
     maxHeapSize = K_to_words(maxsize);
     uintptr_t initialSize = K_to_words(initialsize);
+
+    maxStackSize = maxHeapSize != 0 && maxHeapSize <= MAXIMUMADDRESS ? maxHeapSize : MAXIMUMADDRESS;
 
     uintptr_t memsize = GetPhysicalMemorySize() / sizeof(PolyWord);
 
@@ -174,6 +183,8 @@ void HeapSizeParameters::SetHeapParameters(uintptr_t minsize, uintptr_t maxsize,
     }
     // Together with the constraints on user settings that ensures this holds.
     ASSERT(initialSize >= minHeapSize && initialSize <= maxHeapSize);
+
+    allowGCSharing = gcshare;
 
     // Initially we divide the space equally between the major and
     // minor heaps.  That means that there will definitely be space
@@ -382,13 +393,13 @@ void HeapSizeParameters::AdjustSizeAfterMajorGC(uintptr_t wordsRequired)
         performSharingPass = false;
         cumulativeSharingSaving = 0;
     }
-    else
+    else if (allowGCSharing)
     {
         uintptr_t newHeapSizeWithSharing;
         double costWithSharing;
         // Get the cost and heap size if sharing was enabled.  If we are at the
         // limit, though, we need to work using the size we can achieve.
-        if (! allocationFailedBeforeLastMajorGC)
+        if (!allocationFailedBeforeLastMajorGC)
             (void)getCostAndSize(newHeapSizeWithSharing, wordsRequired, costWithSharing, true);
         else
         {
@@ -425,6 +436,7 @@ void HeapSizeParameters::AdjustSizeAfterMajorGC(uintptr_t wordsRequired)
             }
         }
     }
+    else performSharingPass = false;
 
     if (debugOptions & DEBUG_HEAPSIZE)
     {
@@ -447,13 +459,18 @@ void HeapSizeParameters::AdjustSizeAfterMajorGC(uintptr_t wordsRequired)
     // allocate something very big.
     uintptr_t nextLimit = highWaterMark + highWaterMark / 32 + wordsRequired;
     if (nextLimit > newHeapSize) nextLimit = newHeapSize;
+    // If the GC could not copy everything out of the allocation areas they are
+    // not empty and have not been deleted.  AllocHeapSpace compares
+    // spaceBeforeMinorGC with their total size so include them here, otherwise
+    // we may not be able to create a new area, e.g. for a large object.
+    uintptr_t currAlloc = gMem.CurrentAllocSpace();
     // gMem.CurrentHeapSize() is the live space size.
     if (gMem.CurrentHeapSize() > nextLimit)
     // This previously set the space to zero which resulted in a Run out of space
     // error.  Instead allow at least this allocation in the hope that everything
     // will sort itself out.
-        gMem.SetSpaceBeforeMinorGC(wordsRequired);
-    else gMem.SetSpaceBeforeMinorGC((nextLimit-gMem.CurrentHeapSize())/2);
+        gMem.SetSpaceBeforeMinorGC(currAlloc + wordsRequired);
+    else gMem.SetSpaceBeforeMinorGC(currAlloc + (nextLimit-gMem.CurrentHeapSize())/2);
 
     lastFreeSpace = newHeapSize - currentSpaceUsed;
     predictedRatio = cost;
