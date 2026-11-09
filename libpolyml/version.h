@@ -32,6 +32,6 @@
 #define FIRST_supported_version 592
 #define LAST_supported_version  592
 
-#define TextVersion             "5.9.2"
+#define TextVersion             "5.9.2-seq5"
 
 #endif
