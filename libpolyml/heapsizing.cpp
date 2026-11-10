@@ -456,8 +456,12 @@ void HeapSizeParameters::AdjustSizeAfterMajorGC(uintptr_t wordsRequired)
     // Also, if we use the whole of the heap we may not then be able to allocate
     // new areas in the major heap without going over the limit.  Restrict it to
     // half of the available heap.  Add the wordsRequired in case we're trying to
-    // allocate something very big.
-    uintptr_t nextLimit = highWaterMark + highWaterMark / 32 + wordsRequired;
+    // allocate something very big.  Raise it by 1/32 of the high water mark at a time
+    // only once paging or a failed allocation has been seen; until then that ramp
+    // only forces extra minor GCs, each of which scans every mutable area.
+    uintptr_t nextLimit = newHeapSize;
+    if (RampAllocationArea())
+        nextLimit = highWaterMark + highWaterMark / 32 + wordsRequired;
     if (nextLimit > newHeapSize) nextLimit = newHeapSize;
     // gMem.CurrentHeapSize() is the live space size.
     if (gMem.CurrentHeapSize() > nextLimit)
@@ -469,6 +473,15 @@ void HeapSizeParameters::AdjustSizeAfterMajorGC(uintptr_t wordsRequired)
 
     lastFreeSpace = newHeapSize - currentSpaceUsed;
     predictedRatio = cost;
+}
+
+// Whether to raise the allocation-area limit gradually, by 1/32 of the high
+// water mark per GC, rather than letting it use the heap size the cost model
+// chose.  The gradual ramp guards against paging, so use it once paging has
+// been detected or an allocation has failed.
+bool HeapSizeParameters::RampAllocationArea() const
+{
+    return pagingLimitSize != 0 || allocationFailedBeforeLastMajorGC;
 }
 
 // Called after a minor GC.  Currently does nothing.
@@ -500,7 +513,10 @@ bool HeapSizeParameters::AdjustSizeAfterMinorGC(uintptr_t spaceAfterGC, uintptr_
 
     if (highWaterMark < gMem.CurrentHeapSize()) highWaterMark = gMem.CurrentHeapSize();
 
-    uintptr_t nextLimit = highWaterMark + highWaterMark / 32;
+    // As after a major GC, ramp the limit by 1/32 only once paging has been seen.
+    uintptr_t nextLimit = gMem.SpaceForHeap();
+    if (RampAllocationArea())
+        nextLimit = highWaterMark + highWaterMark / 32;
     if (nextLimit > gMem.SpaceForHeap()) nextLimit = gMem.SpaceForHeap();
 
     // Set the space available for the allocation area to be the difference between the
@@ -511,8 +527,6 @@ bool HeapSizeParameters::AdjustSizeAfterMinorGC(uintptr_t spaceAfterGC, uintptr_
     uintptr_t currHeap = gMem.CurrentHeapSize();
     uintptr_t currAlloc = gMem.CurrentAllocSpace();
     uintptr_t nonAlloc = currHeap - currAlloc + spaceCopiedOut;
-    // TODO: If we have limited the space to the high water mark + 1/32 but that is less
-    // than we really need we should increase it further.
     uintptr_t allowedAlloc = nonAlloc >= nextLimit ? 0 : nextLimit - nonAlloc;
     // Normally the allocation area will be empty but if we've failed to copy
     // everything out, especially a big object, it may not be.
