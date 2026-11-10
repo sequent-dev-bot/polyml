@@ -2,6 +2,11 @@
    for the result address without keeping the first box live.  A GC on that
    second allocation left the argument box dangling. *)
 
+(* qsort is not exported by the executable on Windows. *)
+case #lookupStruct (PolyML.globalNameSpace) "Windows" of
+    SOME _ => raise NotApplicable
+|   NONE => ();
+
 local
     open Foreign
     val cmp = buildCallback2 ((cPointer, cPointer), cInt)
