@@ -1,7 +1,7 @@
 /*
     Title:  savestate.cpp - Save and Load state
 
-    Copyright (c) 2007, 2015, 2017-19, 2021 David C.J. Matthews
+    Copyright (c) 2007, 2015, 2017-19, 2021, 2025-6 David C.J. Matthews
 
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
@@ -43,10 +43,6 @@
 #include <errno.h>
 #endif
 
-#ifdef HAVE_TIME_H
-#include <time.h>
-#endif
-
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
@@ -70,10 +66,18 @@
 #define ASSERT(x)
 #endif
 
+#include <vector>
+#include <string>
+
 #if (defined(_WIN32))
 #include <tchar.h>
 #define ERRORNUMBER _doserrno
 #define NOMEMORY ERROR_NOT_ENOUGH_MEMORY
+#ifdef _UNICODE
+#define std_tstring std::wstring
+#else
+#define std_tstring std::string
+#endif
 #else
 typedef char TCHAR;
 #define _T(x) x
@@ -88,8 +92,8 @@ typedef char TCHAR;
 #endif
 #define ERRORNUMBER errno
 #define NOMEMORY ENOMEM
+#define std_tstring std::string
 #endif
-
 
 #include "globals.h"
 #include "savestate.h"
@@ -99,7 +103,7 @@ typedef char TCHAR;
 #include "scanaddrs.h"
 #include "arb.h"
 #include "memmgr.h"
-#include "mpoly.h" // For exportTimeStamp
+#include "mpoly.h" // For exportSignature
 #include "exporter.h" // For CopyScan
 #include "machine_dep.h"
 #include "osmem.h"
@@ -108,9 +112,30 @@ typedef char TCHAR;
 #include "rtsentry.h"
 #include "check_objects.h"
 #include "rtsentry.h"
+#include "timing.h" // For getBuildTime
+#include "exporter.h" // For CopyScan
+#include "savestate.h"
 
-#include "../polyexports.h" // For InitHeaderFromExport
-#include "version.h" // For InitHeaderFromExport
+#include "mpoly.h" // For exportSignature
+
+#include "../polyexports.h"
+
+#define SAVE(x) taskData->saveVec.push(x)
+
+#if (defined(_WIN32))
+#include <tchar.h>
+#define ERRORNUMBER _doserrno
+#define NOMEMORY ERROR_NOT_ENOUGH_MEMORY
+#else
+typedef char TCHAR;
+#define _T(x) x
+#define _tfopen fopen
+#define _tcslen strlen
+#define _fputtc fputc
+#define _fputts fputs
+#define ERRORNUMBER errno
+#define NOMEMORY ENOMEM
+#endif
 
 #ifdef _MSC_VER
 // Don't tell me about ISO C++ changes.
@@ -120,39 +145,29 @@ typedef char TCHAR;
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyLoadState(POLYUNSIGNED threadId, POLYUNSIGNED arg);
-    POLYEXTERNALSYMBOL POLYUNSIGNED PolyShowHierarchy(POLYUNSIGNED threadId);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetHierarchy(POLYUNSIGNED threadId);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyRenameParent(POLYUNSIGNED threadId, POLYUNSIGNED childName, POLYUNSIGNED parentName);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyShowParent(POLYUNSIGNED threadId, POLYUNSIGNED arg);
-    POLYEXTERNALSYMBOL POLYUNSIGNED PolyStoreModule(POLYUNSIGNED threadId, POLYUNSIGNED name, POLYUNSIGNED contents);
-    POLYEXTERNALSYMBOL POLYUNSIGNED PolyLoadModule(POLYUNSIGNED threadId, POLYUNSIGNED arg);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyLoadHierarchy(POLYUNSIGNED threadId, POLYUNSIGNED arg);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyStoreModule(POLYUNSIGNED threadId, POLYUNSIGNED filename, POLYUNSIGNED modName, POLYUNSIGNED contents);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyLoadModule(POLYUNSIGNED threadId, POLYUNSIGNED arg);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetModuleDirectory(POLYUNSIGNED threadId);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyShowLoadedModules(POLYUNSIGNED threadId);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetModuleInfo(POLYUNSIGNED threadId, POLYUNSIGNED arg);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyReleaseModule(POLYUNSIGNED threadId, POLYUNSIGNED arg);
 }
-
-// Helper class to close files on exit.
-class AutoClose {
-public:
-    AutoClose(FILE *f = 0): m_file(f) {}
-    ~AutoClose() { if (m_file) ::fclose(m_file); }
-
-    operator FILE*() { return m_file; }
-    FILE* operator = (FILE* p)  { return (m_file = p); }
-
-private:
-    FILE *m_file;
-};
 
 // This is probably generally useful so may be moved into
 // a general header file.
 template<typename BASE> class AutoFree
 {
 public:
-    AutoFree(BASE p = 0): m_value(p) {}
+    AutoFree(BASE p = 0) : m_value(p) {}
     ~AutoFree() { free(m_value); }
 
     // Automatic conversions to the base type.
     operator BASE() { return m_value; }
-    BASE operator = (BASE p)  { return (m_value = p); }
+    BASE operator = (BASE p) { return (m_value = p); }
 
 private:
     BASE m_value;
@@ -170,7 +185,7 @@ private:
  */
 
 #define SAVEDSTATESIGNATURE "POLYSAVE"
-#define SAVEDSTATEVERSION   2
+#define SAVEDSTATEVERSION   3
 
 // File header for a saved state file.  This appears as the first entry
 // in the file.
@@ -189,8 +204,8 @@ typedef struct _savedStateHeader
     off_t       stringTable;            // Pointer to the string table (zero if none)
     size_t      stringTableSize;        // Size of string table
     unsigned    parentNameEntry;        // Position of parent name in string table (0 if top)
-    time_t      timeStamp;            // The time stamp for this file.
-    time_t      parentTimeStamp;      // The time stamp for the parent.
+    struct _moduleId      timeStamp;            // The time stamp for this file.
+    struct _moduleId      parentTimeStamp;      // The time stamp for the parent.
     void       *originalBaseAddr;        // Original base address (32-in-64 only)
 } SavedStateHeader;
 
@@ -205,7 +220,7 @@ typedef struct _savedStateSegmentDescr
     unsigned    relocationSize;         // Size of a relocation entry
     unsigned    segmentFlags;           // Segment flags (see SSF_ values)
     unsigned    segmentIndex;           // The index of this segment or the segment it overwrites
-    void        *originalAddress;       // The base address when the segment was written.
+    struct _moduleId      moduleId;               // The module this came from.
 } SavedStateSegmentDescr;
 
 #define SSF_WRITABLE    1               // The segment contains mutable data
@@ -219,10 +234,10 @@ typedef struct _relocationEntry
     // Each entry indicates a location that has to be set to an address.
     // The location to be set is determined by adding "relocAddress" to the base address of
     // this segment (the one to which these relocations apply) and the value to store
-    // by adding "targetAddress" to the base address of the segment indicated by "targetSegment".
+    // by adding "targetAddress" to the base address of the segment indicated by targetIndex/targetModId.
     POLYUNSIGNED    relocAddress;       // The (byte) offset in this segment that we will set
     POLYUNSIGNED    targetAddress;      // The value to add to the base of the destination segment
-    unsigned        targetSegment;      // The base segment.  0 is IO segment. 
+    unsigned        targetSegment;      // Index into the address table
     ScanRelocationKind relKind;         // The kind of relocation (processor dependent).
 } RelocationEntry;
 
@@ -238,28 +253,36 @@ typedef struct _relocationEntry
 class HierarchyTable
 {
 public:
-    HierarchyTable(const TCHAR *file, time_t time):
+    HierarchyTable(const TCHAR *file, struct _moduleId time):
       fileName(_tcsdup(file)), timeStamp(time) { }
-    AutoFree<TCHAR*> fileName;
-    time_t          timeStamp;
+
+    HierarchyTable() {} // Needed for vector?
+
+    std_tstring         fileName;
+    struct _moduleId    timeStamp;
 };
 
-HierarchyTable **hierarchyTable;
+std::vector <HierarchyTable> hierarchyTable;
 
-static unsigned hierarchyDepth;
+// Information about currently loaded modules.  There will also
+// be permanent memory spaces with the same Ids in gMem.
 
-static bool AddHierarchyEntry(const TCHAR *fileName, time_t timeStamp)
-{
-    // Add an entry to the hierarchy table for this file.
-    HierarchyTable *newEntry = new HierarchyTable(fileName, timeStamp);
-    if (newEntry == 0) return false;
-    HierarchyTable **newTable =
-        (HierarchyTable **)realloc(hierarchyTable, sizeof(HierarchyTable *)*(hierarchyDepth+1));
-    if (newTable == 0) return false;
-    hierarchyTable = newTable;
-    hierarchyTable[hierarchyDepth++] = newEntry;
-    return true;
-}
+class LoadedModuleData {
+public:
+    ModuleId modId;
+    std::vector<ModuleId> modDependencies;
+};
+
+static std::vector<LoadedModuleData> loadedModules;
+
+class ModIdAndName {
+public:
+    ModIdAndName(std_tstring mName, ModuleId mId, bool isM): modName(mName), modId(mId), isModule(isM) {}
+    std_tstring modName;
+    ModuleId modId;
+    bool isModule; // True if a module, false if a saved state.
+};
+
 
 // Test whether we're overwriting a parent of ourself.
 #if (defined(_WIN32) || defined(__CYGWIN__))
@@ -300,98 +323,42 @@ static bool sameFile(const char *x, const char *y)
  *  Saving state.
  */
 
-// This class is used to create the relocations.  It uses Exporter
-// for this but this may perhaps be too heavyweight.
-class SaveStateExport: public Exporter, public ScanAddress
+ // Request to the main thread to save data.
+class SaveRequest : public MainThreadRequest, public StateExport
 {
 public:
-    SaveStateExport(unsigned int h=0): Exporter(h), relocationCount(0) {}
+    SaveRequest(const TCHAR* name, unsigned h) : MainThreadRequest(MTP_SAVESTATE),
+        fileName(name), newHierarchy(h), relocationCount(0) {
+    }
+
+    virtual void Perform();
+    const TCHAR* fileName;
+    unsigned newHierarchy;
+
 public:
     virtual void exportStore(void) {} // Not used.
 
-private:
-    // ScanAddress overrides
-    virtual void ScanConstant(PolyObject *base, byte *addrOfConst, ScanRelocationKind code, intptr_t displacement);
-    // At the moment we should only get calls to ScanConstant.
-    virtual PolyObject *ScanObjectAddress(PolyObject *base) { return base; }
-
 protected:
-    void setRelocationAddress(void *p, POLYUNSIGNED *reloc);
-    PolyWord createRelocation(PolyWord p, void *relocAddr);
+    void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
     unsigned relocationCount;
-
-    friend class SaveRequest;
 };
 
-
-// Generate the address relative to the start of the segment.
-void SaveStateExport::setRelocationAddress(void *p, POLYUNSIGNED *reloc)
-{
-    unsigned area = findArea(p);
-    POLYUNSIGNED offset = (POLYUNSIGNED)((char*)p - (char*)memTable[area].mtOriginalAddr);
-    *reloc = offset;
-}
-
-
 // Create a relocation entry for an address at a given location.
-PolyWord SaveStateExport::createRelocation(PolyWord p, void *relocAddr)
+// This is currently never called in compact 32-bit mode because Exporter::relocateValue does
+// not call createRelocation in 32-in-64 mode.
+void SaveRequest::createActualRelocation(void *addr, void* relocAddr, ScanRelocationKind kind)
 {
     RelocationEntry reloc;
     // Set the offset within the section we're scanning.
     setRelocationAddress(relocAddr, &reloc.relocAddress);
-    void *addr = p.AsAddress();
+
     unsigned addrArea = findArea(addr);
     reloc.targetAddress = (POLYUNSIGNED)((char*)addr - (char*)memTable[addrArea].mtOriginalAddr);
-    reloc.targetSegment = (unsigned)memTable[addrArea].mtIndex;
-    reloc.relKind = PROCESS_RELOC_DIRECT;
-    fwrite(&reloc, sizeof(reloc), 1, exportFile);
-    relocationCount++;
-    return p; // Don't change the contents
-}
-
-
-/* This is called for each constant within the code. 
-   Print a relocation entry for the word and return a value that means
-   that the offset is saved in original word. */
-void SaveStateExport::ScanConstant(PolyObject *base, byte *addr, ScanRelocationKind code, intptr_t displacement)
-{
-    PolyObject *p = GetConstantValue(addr, code, displacement);
-
-    if (p == 0)
-        return;
-
-    void *a = p;
-    unsigned aArea = findArea(a);
-
-    // We don't need a relocation if this is relative to the current segment
-    // since the relative address will already be right.
-    if (code == PROCESS_RELOC_I386RELATIVE && aArea == findArea(addr))
-        return;
-
-    // Set the value at the address to the offset relative to the symbol.
-    RelocationEntry reloc;
-    setRelocationAddress(addr, &reloc.relocAddress);
-    reloc.targetAddress = (POLYUNSIGNED)((char*)a - (char*)memTable[aArea].mtOriginalAddr);
-    reloc.targetSegment = (unsigned)memTable[aArea].mtIndex;
-    reloc.relKind = code;
+    reloc.targetSegment = addrArea;
+    reloc.relKind = kind;
     fwrite(&reloc, sizeof(reloc), 1, exportFile);
     relocationCount++;
 }
-
-// Request to the main thread to save data.
-class SaveRequest: public MainThreadRequest
-{
-public:
-    SaveRequest(const TCHAR *name, unsigned h): MainThreadRequest(MTP_SAVESTATE),
-        fileName(name), newHierarchy(h),
-        errorMessage(0), errCode(0) {}
-
-    virtual void Perform();
-    const TCHAR *fileName;
-    unsigned newHierarchy;
-    const char *errorMessage;
-    int errCode;
-};
 
 // This class is used to update references to objects that have moved.  If
 // we have copied an object into the area to be exported we may still have references
@@ -470,77 +437,153 @@ void SaveFixupAddress::ScanCodeSpace(CodeSpace *space)
     }
 }
 
+// Exported function also used by the modules system.
+void switchLocalsToPermanent()
+{
+    // Update references to moved objects.
+    SaveFixupAddress fixup;
+    for (std::vector<LocalMemSpace*>::iterator i = gMem.lSpaces.begin(); i < gMem.lSpaces.end(); i++)
+    {
+        LocalMemSpace* space = *i;
+        fixup.ScanAddressesInRegion(space->bottom, space->lowerAllocPtr);
+        fixup.ScanAddressesInRegion(space->upperAllocPtr, space->top);
+    }
+    for (std::vector<CodeSpace*>::iterator i = gMem.cSpaces.begin(); i < gMem.cSpaces.end(); i++)
+        fixup.ScanCodeSpace(*i);
+
+    GCModules(&fixup);
+
+    // Restore the length words in the code areas.
+    // Although we've updated any pointers to the start of the code we could have return addresses
+    // pointing to the original code.  GCModules updates the stack but doesn't update return addresses.
+    for (std::vector<CodeSpace*>::iterator i = gMem.cSpaces.begin(); i < gMem.cSpaces.end(); i++)
+    {
+        CodeSpace* space = *i;
+        for (PolyWord* pt = space->bottom; pt < space->top; )
+        {
+            pt++;
+            PolyObject* obj = (PolyObject*)pt;
+            if (obj->ContainsForwardingPtr())
+            {
+#ifdef POLYML32IN64
+                PolyObject* forwardedTo = obj;
+                while (forwardedTo->ContainsForwardingPtr())
+                    forwardedTo = (PolyObject*)(globalCodeBase + ((forwardedTo->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
+#else
+                PolyObject* forwardedTo = obj->FollowForwardingChain();
+#endif
+                POLYUNSIGNED lengthWord = forwardedTo->LengthWord();
+                space->writeAble(obj)->SetLengthWord(lengthWord);
+            }
+            pt += obj->Length();
+        }
+    }
+}
+
 // Called by the root thread to actually save the state and write the file.
 void SaveRequest::Perform()
 {
-    if (debugOptions & DEBUG_SAVING)
-        Log("SAVE: Beginning saving state.\n");
-    // Check that we aren't overwriting our own parent.
-    for (unsigned q = 0; q < newHierarchy-1; q++) {
-        if (sameFile(hierarchyTable[q]->fileName, fileName))
-        {
-            errorMessage = "File being saved is used as a parent of this file";
-            errCode = 0;
-            if (debugOptions & DEBUG_SAVING)
-                Log("SAVE: File being saved is used as a parent of this file.\n");
-            return;
-        }
-    }
-
-    SaveStateExport exports;
-    // Open the file.  This could quite reasonably fail if the path is wrong.
-    exports.exportFile = _tfopen(fileName, _T("wb"));
-    if (exports.exportFile == NULL)
-    {
-        errorMessage = "Cannot open save file";
-        errCode = ERRORNUMBER;
-        if (debugOptions & DEBUG_SAVING)
-            Log("SAVE: Cannot open save file.\n");
-        return;
-    }
-
-    // Scan over the permanent mutable area copying all reachable data that is
-    // not in a lower hierarchy into new permanent segments.
-    CopyScan copyScan(newHierarchy);
-    copyScan.initialise(false);
-    bool success = true;
     try {
-        for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
-        {
-            PermanentMemSpace *space = *i;
-            if (space->isMutable && !space->noOverwrite && !space->byteOnly)
+        if (debugOptions & DEBUG_SAVING)
+            Log("SAVE: Beginning saving state.\n");
+        // Check that we aren't overwriting our own parent.
+        for (unsigned q = 0; q < newHierarchy - 1; q++) {
+            if (sameFile(hierarchyTable[q].fileName.c_str(), fileName))
             {
+                errorMessage = "File being saved is used as a parent of this file";
+                errNumber = 0;
                 if (debugOptions & DEBUG_SAVING)
-                    Log("SAVE: Scanning permanent mutable area %p allocated at %p size %lu\n",
-                        space, space->bottom, space->spaceSize());
-                copyScan.ScanAddressesInRegion(space->bottom, space->top);
+                    Log("SAVE: File being saved is used as a parent of this file.\n");
+                return;
             }
         }
-    }
-    catch (MemoryException &)
-    {
-        success = false;
-        if (debugOptions & DEBUG_SAVING)
-            Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
-    }
 
-    // Copy the areas into the export object.  Make sufficient space for
-    // the largest possible number of entries.
-    exports.memTable = new memoryTableEntry[gMem.eSpaces.size()+gMem.pSpaces.size()+1];
-    unsigned memTableCount = 0;
-
-    // Permanent spaces at higher level.  These have to have entries although
-    // only the mutable entries will be written.
-    for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
-    {
-        PermanentMemSpace *space = *i;
-        if (space->hierarchy < newHierarchy)
+        // Open the file.  This could quite reasonably fail if the path is wrong.
+        exportFile = _tfopen(fileName, _T("wb"));
+        if (exportFile == NULL)
         {
-            memoryTableEntry *entry = &exports.memTable[memTableCount++];
+            errorMessage = "Cannot open save file";
+            errNumber = ERRORNUMBER;
+            if (debugOptions & DEBUG_SAVING)
+                Log("SAVE: Cannot open save file.\n");
+            return;
+        }
+
+        // Scan over the permanent mutable area copying all reachable data that is
+        // not in a lower hierarchy into new permanent segments.
+        CopyScan copyScan;
+        // Set the dependencies.
+        copyScan.dependencies[exportSignature] = true; // Always include the executable
+        // Include any existing states at a higher level
+        for (unsigned i = 0; i < newHierarchy - 1; i++)
+            copyScan.dependencies[hierarchyTable[i].timeStamp] = true;
+        copyScan.initialise();
+
+        bool success = true;
+        try {
+            for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
+            {
+                PermanentMemSpace* space = *i;
+                if (space->isMutable && !space->noOverwrite && !space->byteOnly)
+                {
+                    if (debugOptions & DEBUG_SAVING)
+                        Log("SAVE: Scanning permanent mutable area %p allocated at %p size %lu\n",
+                            space, space->bottom, space->spaceSize());
+                    copyScan.ScanAddressesInRegion(space->bottom, space->top);
+                }
+            }
+            // We may have copied data out of modules.  Restore forwarding pointers in them.
+            CopyScan::fixPermanentAreas();
+        }
+        catch (MemoryException&)
+        {
+            success = false;
+            if (debugOptions & DEBUG_SAVING)
+                Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
+        }
+
+        // Copy the areas into the export object.  Make sufficient space for
+        // the largest possible number of entries.
+        memTable = new ExportMemTable[gMem.eSpaces.size() + gMem.pSpaces.size() + 1];
+        unsigned memTableCount = 0;
+
+        // Permanent spaces at higher level.  These have to have entries although
+        // only the mutable entries will be written.
+        for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
+        {
+            PermanentMemSpace* space = *i;
+            if (copyScan.dependencies[space->moduleIdentifier])
+            {
+                ExportMemTable* entry = &memTable[memTableCount++];
+                entry->mtOriginalAddr = entry->mtCurrentAddr = space->bottom;
+                entry->mtLength = (space->topPointer - space->bottom) * sizeof(PolyWord);
+                entry->mtIndex = space->index;
+                entry->mtFlags = 0;
+                entry->mtModId = space->moduleIdentifier;
+                if (space->isMutable)
+                {
+                    entry->mtFlags |= MTF_WRITEABLE;
+                    if (space->noOverwrite) entry->mtFlags |= MTF_NO_OVERWRITE;
+                    if (space->byteOnly) entry->mtFlags |= MTF_BYTES;
+                }
+                if (space->isCode)
+                    entry->mtFlags |= MTF_EXECUTABLE;
+            }
+        }
+        unsigned permanentEntries = memTableCount; // Remember where new entries start.
+
+        exportModId = copyScan.extractHash();
+
+        // Newly created spaces.
+        for (std::vector<PermanentMemSpace*>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
+        {
+            ExportMemTable* entry = &memTable[memTableCount++];
+            PermanentMemSpace* space = *i;
             entry->mtOriginalAddr = entry->mtCurrentAddr = space->bottom;
-            entry->mtLength = (space->topPointer-space->bottom)*sizeof(PolyWord);
+            entry->mtLength = (space->topPointer - space->bottom) * sizeof(PolyWord);
             entry->mtIndex = space->index;
             entry->mtFlags = 0;
+            entry->mtModId = exportModId;
             if (space->isMutable)
             {
                 entry->mtFlags |= MTF_WRITEABLE;
@@ -550,209 +593,176 @@ void SaveRequest::Perform()
             if (space->isCode)
                 entry->mtFlags |= MTF_EXECUTABLE;
         }
-    }
-    unsigned permanentEntries = memTableCount; // Remember where new entries start.
 
-    // Newly created spaces.
-    for (std::vector<PermanentMemSpace *>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
-    {
-        memoryTableEntry *entry = &exports.memTable[memTableCount++];
-        PermanentMemSpace *space = *i;
-        entry->mtOriginalAddr = entry->mtCurrentAddr = space->bottom;
-        entry->mtLength = (space->topPointer-space->bottom)*sizeof(PolyWord);
-        entry->mtIndex = space->index;
-        entry->mtFlags = 0;
-        if (space->isMutable)
-        {
-            entry->mtFlags |= MTF_WRITEABLE;
-            if (space->noOverwrite) entry->mtFlags |= MTF_NO_OVERWRITE;
-            if (space->byteOnly) entry->mtFlags |= MTF_BYTES;
-        }
-        if (space->isCode)
-            entry->mtFlags |= MTF_EXECUTABLE;
-    }
+        memTableEntries = memTableCount;
 
-    exports.memTableEntries = memTableCount;
-
-    if (debugOptions & DEBUG_SAVING)
-        Log("SAVE: Updating references to moved objects.\n");
-
-    // Update references to moved objects.
-    SaveFixupAddress fixup;
-    for (std::vector<LocalMemSpace*>::iterator i = gMem.lSpaces.begin(); i < gMem.lSpaces.end(); i++)
-    {
-        LocalMemSpace *space = *i;
-        fixup.ScanAddressesInRegion(space->bottom, space->lowerAllocPtr);
-        fixup.ScanAddressesInRegion(space->upperAllocPtr, space->top);
-    }
-    for (std::vector<CodeSpace *>::iterator i = gMem.cSpaces.begin(); i < gMem.cSpaces.end(); i++)
-        fixup.ScanCodeSpace(*i);
-
-    GCModules(&fixup);
-
-    // Restore the length words in the code areas.
-    // Although we've updated any pointers to the start of the code we could have return addresses
-    // pointing to the original code.  GCModules updates the stack but doesn't update return addresses.
-    for (std::vector<CodeSpace *>::iterator i = gMem.cSpaces.begin(); i < gMem.cSpaces.end(); i++)
-    {
-        CodeSpace *space = *i;
-        for (PolyWord *pt = space->bottom; pt < space->top; )
-        {
-            pt++;
-            PolyObject *obj = (PolyObject*)pt;
-            if (obj->ContainsForwardingPtr())
-            {
-#ifdef POLYML32IN64
-                PolyObject *forwardedTo = obj;
-                while (forwardedTo->ContainsForwardingPtr())
-                    forwardedTo = (PolyObject*)(globalCodeBase + ((forwardedTo->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
-#else
-                PolyObject *forwardedTo = obj->FollowForwardingChain();
-#endif
-                POLYUNSIGNED lengthWord = forwardedTo->LengthWord();
-                space->writeAble(obj)->SetLengthWord(lengthWord);
-            }
-            pt += obj->Length();
-        }
-    }
-
-    // Update the global memory space table.  Old segments at the same level
-    // or lower are removed.  The new segments become permanent.
-    // Try to promote the spaces even if we've had a failure because export
-    // spaces are deleted in ~CopyScan and we may have already copied
-    // some objects there.
-    if (debugOptions & DEBUG_SAVING)
-        Log("SAVE: Promoting export spaces to permanent spaces.\n");
-    if (! gMem.PromoteExportSpaces(newHierarchy) || ! success)
-    {
-        errorMessage = "Out of Memory";
-        errCode = NOMEMORY;
         if (debugOptions & DEBUG_SAVING)
-            Log("SAVE: Unable to promote export spaces.\n");
-        return;
-    }
-    // Remove any deeper entries from the hierarchy table.
-    while (hierarchyDepth > newHierarchy-1)
-    {
-        hierarchyDepth--;
-        delete(hierarchyTable[hierarchyDepth]);
-        hierarchyTable[hierarchyDepth] = 0;
-    }
+            Log("SAVE: Updating references to moved objects.\n");
+        // We always switch to the permanent space even if there's been a
+        // failure since it is possible to re-save.
+        switchLocalsToPermanent();
 
-    if (debugOptions & DEBUG_SAVING)
-        Log("SAVE: Writing out data.\n");
-
-    // Write out the file header.
-    SavedStateHeader saveHeader;
-    memset(&saveHeader, 0, sizeof(saveHeader));
-    saveHeader.headerLength = sizeof(saveHeader);
-    memcpy(saveHeader.headerSignature,
-        SAVEDSTATESIGNATURE, sizeof(saveHeader.headerSignature));
-    saveHeader.headerVersion = SAVEDSTATEVERSION;
-    saveHeader.segmentDescrLength = sizeof(SavedStateSegmentDescr);
-    if (newHierarchy == 1)
-        saveHeader.parentTimeStamp = exportTimeStamp;
-    else
-    {
-        saveHeader.parentTimeStamp = hierarchyTable[newHierarchy-2]->timeStamp;
-        saveHeader.parentNameEntry = sizeof(TCHAR); // Always the first entry.
-    }
-    saveHeader.timeStamp = getBuildTime();
-    saveHeader.segmentDescrCount = exports.memTableEntries; // One segment for each space.
-#ifdef POLYML32IN64
-    saveHeader.originalBaseAddr = globalHeapBase;
-#endif
-    // Write out the header.
-    fwrite(&saveHeader, sizeof(saveHeader), 1, exports.exportFile);
-
-    // We need a segment header for each permanent area whether it is
-    // actually in this file or not.
-    SavedStateSegmentDescr *descrs = new SavedStateSegmentDescr [exports.memTableEntries];
-
-    for (unsigned j = 0; j < exports.memTableEntries; j++)
-    {
-        memoryTableEntry *entry = &exports.memTable[j];
-        memset(&descrs[j], 0, sizeof(SavedStateSegmentDescr));
-        descrs[j].relocationSize = sizeof(RelocationEntry);
-        descrs[j].segmentIndex = (unsigned)entry->mtIndex;
-        descrs[j].segmentSize = entry->mtLength; // Set this even if we don't write it.
-        descrs[j].originalAddress = entry->mtOriginalAddr;
-        if (entry->mtFlags & MTF_WRITEABLE)
+        // Update the global memory space table.  Old segments at the same level
+        // or lower are removed.  The new segments become permanent.
+        // Try to promote the spaces even if we've had a failure because export
+        // spaces are deleted in ~CopyScan and we may have already copied
+        // some objects there.
+        if (debugOptions & DEBUG_SAVING)
+            Log("SAVE: Promoting export spaces to permanent spaces.\n");
+        // Remove any deeper entries from the hierarchy table.
+        for (unsigned i = newHierarchy - 1; i < hierarchyTable.size(); i++)
         {
-            descrs[j].segmentFlags |= SSF_WRITABLE;
-            if (entry->mtFlags & MTF_NO_OVERWRITE)
-                descrs[j].segmentFlags |= SSF_NOOVERWRITE;
-            if (j < permanentEntries && (entry->mtFlags & MTF_NO_OVERWRITE) == 0)
-                descrs[j].segmentFlags |= SSF_OVERWRITE;
-            if (entry->mtFlags & MTF_BYTES)
-                descrs[j].segmentFlags |= SSF_BYTES;
-        }
-        if (entry->mtFlags & MTF_EXECUTABLE)
-            descrs[j].segmentFlags |= SSF_CODE;
-    }
-    // Write out temporarily. Will be overwritten at the end.
-    saveHeader.segmentDescr = ftell(exports.exportFile);
-    fwrite(descrs, sizeof(SavedStateSegmentDescr), exports.memTableEntries, exports.exportFile);
-
-    // Write out the relocations and the data.
-    for (unsigned k = 1 /* Not IO area */; k < exports.memTableEntries; k++)
-    {
-        memoryTableEntry *entry = &exports.memTable[k];
-        // Write out the contents if this is new or if it is a normal, overwritable
-        // mutable area.
-        if (k >= permanentEntries ||
-            (entry->mtFlags & (MTF_WRITEABLE|MTF_NO_OVERWRITE)) == MTF_WRITEABLE)
-        {
-            descrs[k].relocations = ftell(exports.exportFile);
-            // Have to write this out.
-            exports.relocationCount = 0;
-            // Create the relocation table.
-            char *start = (char*)entry->mtOriginalAddr;
-            char *end = start + entry->mtLength;
-            for (PolyWord *p = (PolyWord*)start; p < (PolyWord*)end; )
+            if (!gMem.DemoteOldPermanentSpaces(hierarchyTable[i].timeStamp))
             {
-                p++;
-                PolyObject *obj = (PolyObject*)p;
-                POLYUNSIGNED length = obj->Length();
-                // Most relocations can be computed when the saved state is
-                // loaded so we only write out the difficult ones: those that
-                // occur within compiled code.
-                //  exports.relocateObject(obj);
-                if (length != 0 && obj->IsCodeObject())
-                    machineDependent->ScanConstantsWithinCode(obj, &exports);
-                p += length;
+                errorMessage = "Out of Memory";
+                errNumber = NOMEMORY;
+                if (debugOptions & DEBUG_SAVING)
+                    Log("SAVE: Unable to demote old spaces.\n");
             }
-            descrs[k].relocationCount = exports.relocationCount;
-            // Write out the data.
-            descrs[k].segmentData = ftell(exports.exportFile);
-            fwrite(entry->mtOriginalAddr, entry->mtLength, 1, exports.exportFile);
-       }
+        }
+        hierarchyTable.resize(newHierarchy - 1);
+
+        if (!gMem.PromoteNewExportSpaces(exportModId) || !success)
+        {
+            errorMessage = "Out of Memory";
+            errNumber = NOMEMORY;
+            if (debugOptions & DEBUG_SAVING)
+                Log("SAVE: Unable to promote export spaces.\n");
+            return;
+        }
+
+        if (debugOptions & DEBUG_SAVING)
+            Log("SAVE: Writing out data.\n");
+
+        // TODO: We should handle write failures e.g. if the disc becomes full.
+
+        // Write out the file header.
+        SavedStateHeader saveHeader;
+        memset(&saveHeader, 0, sizeof(saveHeader));
+        saveHeader.headerLength = sizeof(saveHeader);
+        memcpy(saveHeader.headerSignature,
+            SAVEDSTATESIGNATURE, sizeof(saveHeader.headerSignature));
+        saveHeader.headerVersion = SAVEDSTATEVERSION;
+        saveHeader.segmentDescrLength = sizeof(SavedStateSegmentDescr);
+        if (newHierarchy == 1)
+            saveHeader.parentTimeStamp = exportSignature;
+        else
+        {
+            saveHeader.parentTimeStamp = hierarchyTable[newHierarchy - 2].timeStamp;
+            saveHeader.parentNameEntry = sizeof(TCHAR); // Always the first entry.
+        }
+        saveHeader.timeStamp = copyScan.extractHash();
+        saveHeader.segmentDescrCount = memTableEntries; // One segment for each space.
+#ifdef POLYML32IN64
+        saveHeader.originalBaseAddr = globalHeapBase;
+#endif
+        // Write out the header.
+        fwrite(&saveHeader, sizeof(saveHeader), 1, exportFile);
+
+        // We need a segment header for each permanent area whether it is
+        // actually in this file or not.
+        std::vector<SavedStateSegmentDescr> descrs;
+        descrs.reserve(memTableEntries);
+        // Write out temporarily. Will be overwritten at the end.
+        saveHeader.segmentDescr = ftell(exportFile);
+
+        for (unsigned j = 0; j < memTableEntries; j++)
+        {
+            ExportMemTable* entry = &memTable[j];
+            SavedStateSegmentDescr descr;
+            memset(&descr, 0, sizeof(SavedStateSegmentDescr));
+            descr.relocationSize = sizeof(RelocationEntry);
+            descr.segmentIndex = (unsigned)entry->mtIndex;
+            descr.segmentSize = entry->mtLength; // Set this even if we don't write it.
+            descr.moduleId = entry->mtModId;
+            if (entry->mtFlags & MTF_WRITEABLE)
+            {
+                descr.segmentFlags |= SSF_WRITABLE;
+                if (entry->mtFlags & MTF_NO_OVERWRITE)
+                    descr.segmentFlags |= SSF_NOOVERWRITE;
+                if (j < permanentEntries && (entry->mtFlags & MTF_NO_OVERWRITE) == 0)
+                    descr.segmentFlags |= SSF_OVERWRITE;
+                if (entry->mtFlags & MTF_BYTES)
+                    descr.segmentFlags |= SSF_BYTES;
+            }
+            if (entry->mtFlags & MTF_EXECUTABLE)
+                descr.segmentFlags |= SSF_CODE;
+            if(!checkedFwrite(&descr, sizeof(SavedStateSegmentDescr), 1))
+                return;
+            descrs.push_back(descr);
+        }
+
+        // Write out the relocations and the data.
+        for (unsigned k = 1 /* Not IO area */; k < memTableEntries; k++)
+        {
+            ExportMemTable* entry = &memTable[k];
+            // Write out the contents if this is new or if it is a normal, overwritable
+            // mutable area.
+            if (k >= permanentEntries ||
+                (entry->mtFlags & (MTF_WRITEABLE | MTF_NO_OVERWRITE)) == MTF_WRITEABLE)
+            {
+                descrs[k].relocations = ftell(exportFile);
+                // Have to write this out.
+                relocationCount = 0;
+                // Create the relocation table.
+                char* start = (char*)entry->mtOriginalAddr;
+                char* end = start + entry->mtLength;
+                for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+                {
+                    p++;
+                    PolyObject* obj = (PolyObject*)p;
+                    POLYUNSIGNED length = obj->Length();
+                    // Now include all relocations rather than trying to sort them out when loading.
+                    if (length != 0 && obj->IsCodeObject())
+                        machineDependent->ScanConstantsWithinCode(obj, this);
+                    relocateObject(obj);
+                    p += length;
+                }
+                descrs[k].relocationCount = relocationCount;
+                // Write out the data.
+                descrs[k].segmentData = ftell(exportFile);
+                if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
+                    return;
+            }
+        }
+
+        // If this is a child we need to write a string table containing the parent name.
+        if (newHierarchy > 1)
+        {
+            saveHeader.stringTable = ftell(exportFile);
+            _fputtc(0, exportFile); // First byte of string table is zero
+            _fputts(hierarchyTable[newHierarchy - 2].fileName.c_str(), exportFile);
+            _fputtc(0, exportFile); // A terminating null.
+            saveHeader.stringTableSize = (_tcslen(hierarchyTable[newHierarchy - 2].fileName.c_str()) + 2) * sizeof(TCHAR);
+        }
+
+        if (ferror(exportFile))
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Error while writing string table";
+            return;
+        }
+
+        // Rewrite the header and the segment tables now they're complete.
+        fseek(exportFile, 0, SEEK_SET);
+        if (!checkedFwrite(&saveHeader, sizeof(saveHeader), 1))
+            return;
+        if (!checkedFwrite(descrs.data(), sizeof(SavedStateSegmentDescr), memTableEntries))
+            return;
+
+        if (debugOptions & DEBUG_SAVING)
+            Log("SAVE: Writing complete.\n");
+
+        // Add an entry to the hierarchy table for this file.
+        hierarchyTable.push_back(HierarchyTable(fileName, saveHeader.timeStamp));
+
+        CheckMemory();
     }
 
-    // If this is a child we need to write a string table containing the parent name.
-    if (newHierarchy > 1)
+    catch (const std::bad_alloc&)
     {
-        saveHeader.stringTable = ftell(exports.exportFile);
-        _fputtc(0, exports.exportFile); // First byte of string table is zero
-        _fputts(hierarchyTable[newHierarchy-2]->fileName, exports.exportFile);
-        _fputtc(0, exports.exportFile); // A terminating null.
-        saveHeader.stringTableSize = (_tcslen(hierarchyTable[newHierarchy-2]->fileName) + 2)*sizeof(TCHAR);
+        errorMessage = "Insufficient Memory: C++ allocation failed";
     }
-
-    // Rewrite the header and the segment tables now they're complete.
-    fseek(exports.exportFile, 0, SEEK_SET);
-    fwrite(&saveHeader, sizeof(saveHeader), 1, exports.exportFile);
-    fwrite(descrs, sizeof(SavedStateSegmentDescr), exports.memTableEntries, exports.exportFile);
-
-    if (debugOptions & DEBUG_SAVING)
-        Log("SAVE: Writing complete.\n");
-
-    // Add an entry to the hierarchy table for this file.
-    (void)AddHierarchyEntry(fileName, saveHeader.timeStamp);
-
-    delete[](descrs);
-
-    CheckMemory();
 }
 
 // Write a saved state file.
@@ -768,7 +778,7 @@ POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNS
         // The value of depth is zero for top-level save so we need to add one for hierarchy.
         unsigned newHierarchy = get_C_unsigned(taskData, PolyWord::FromUnsigned(depth)) + 1;
 
-        if (newHierarchy > hierarchyDepth + 1)
+        if (newHierarchy > hierarchyTable.size() + 1)
             raise_fail(taskData, "Depth must be no more than the current hierarchy plus one");
 
         // Request a full GC first.  The main reason is to avoid running out of memory as a
@@ -779,8 +789,9 @@ POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNS
         SaveRequest request(fileNameBuff, newHierarchy);
         processes->MakeRootRequest(taskData, &request);
         if (request.errorMessage)
-            raise_syscall(taskData, request.errorMessage, request.errCode);
+            raise_syscall(taskData, request.errorMessage, request.errNumber);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -799,7 +810,7 @@ public:
         isHierarchy(isH), fileNameList(files), errorResult(0), errNumber(0) { }
 
     virtual void Perform(void);
-    bool LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail);
+    bool LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail);
     bool isHierarchy;
     Handle fileNameList;
     const char *errorResult;
@@ -810,47 +821,55 @@ public:
     int errNumber;
 };
 
+// Data needed for relocation during load.
+class StateLoadData {
+public:
+    StateLoadData() : relocations(0), relocationCount(0), targetAddr(0) {}
+
+    off_t       relocations;        // Copied from descriptor
+    unsigned    relocationCount;
+    PolyWord* targetAddr;           // Actual address of the segment
+};
+
 // Called by the main thread once all the ML threads have stopped.
 void StateLoader::Perform(void)
 {
-    // Copy the first file name into the buffer.
-    if (isHierarchy)
-    {
-        if (ML_Cons_Cell::IsNull(fileNameList->Word()))
+    try {
+        // Copy the first file name into the buffer.
+        if (isHierarchy)
         {
-            errorResult = "Hierarchy list is empty";
-            return;
+            if (ML_Cons_Cell::IsNull(fileNameList->Word()))
+            {
+                errorResult = "Hierarchy list is empty";
+                return;
+            }
+            ML_Cons_Cell* p = DEREFLISTHANDLE(fileNameList);
+            fileName = Poly_string_to_T_alloc(p->h);
+            if (fileName == NULL)
+            {
+                errorResult = "Insufficient memory";
+                errNumber = NOMEMORY;
+                return;
+            }
+            (void)LoadFile(true, ModuleId(), p->t);
         }
-        ML_Cons_Cell *p = DEREFLISTHANDLE(fileNameList);
-        fileName = Poly_string_to_T_alloc(p->h);
-        if (fileName == NULL)
+        else
         {
-            errorResult = "Insufficient memory";
-            errNumber = NOMEMORY;
-            return;
+            fileName = Poly_string_to_T_alloc(fileNameList->Word());
+            if (fileName == NULL)
+            {
+                errorResult = "Insufficient memory";
+                errNumber = NOMEMORY;
+                return;
+            }
+            (void)LoadFile(true, ModuleId(), TAGGED(0));
         }
-        (void)LoadFile(true, 0, p->t);
     }
-    else
+    catch (const std::bad_alloc&)
     {
-        fileName = Poly_string_to_T_alloc(fileNameList->Word());
-        if (fileName == NULL)
-        {
-            errorResult = "Insufficient memory";
-            errNumber = NOMEMORY;
-            return;
-        }
-        (void)LoadFile(true, 0, TAGGED(0));
+        errorResult = "Insufficient Memory: C++ allocation failed";
     }
 }
-
-class ClearVolatile: public ScanAddress
-{
-public:
-    ClearVolatile() {}
-    virtual PolyObject *ScanObjectAddress(PolyObject *base) { return base; }
-    virtual void ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthWord);
-};
 
 // Set the values of external references and clear the values of other weak byte refs.
 void ClearVolatile::ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthWord)
@@ -877,210 +896,8 @@ void ClearVolatile::ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthW
     }
 }
 
-// This is copied from the B-tree in MemMgr.  It probably should be
-// merged but will do for the moment.  It's intended to reduce the
-// cost of finding the segment for relocation.
-
-class SpaceBTree
-{
-public:
-    SpaceBTree(bool is, unsigned i = 0) : isLeaf(is), index(i) { }
-    virtual ~SpaceBTree() {}
-
-    bool isLeaf;
-    unsigned index; // The index if this is a leaf
-};
-
-// A non-leaf node in the B-tree
-class SpaceBTreeTree : public SpaceBTree
-{
-public:
-    SpaceBTreeTree();
-    virtual ~SpaceBTreeTree();
-
-    SpaceBTree *tree[256];
-};
-
-SpaceBTreeTree::SpaceBTreeTree() : SpaceBTree(false)
-{
-    for (unsigned i = 0; i < 256; i++)
-        tree[i] = 0;
-}
-
-SpaceBTreeTree::~SpaceBTreeTree()
-{
-    for (unsigned i = 0; i < 256; i++)
-        delete(tree[i]);
-}
-
-
-// This class is used to relocate addresses in areas that have been loaded.
-class LoadRelocate: public ScanAddress
-{
-public:
-    LoadRelocate(bool pcc = false): processCodeConstants(pcc), originalBaseAddr(0), descrs(0),
-        targetAddresses(0), nDescrs(0), spaceTree(0) {}
-    ~LoadRelocate();
-
-    void RelocateObject(PolyObject *p);
-    virtual PolyObject *ScanObjectAddress(PolyObject *base) { ASSERT(0); return base; } // Not used
-    virtual void ScanConstant(PolyObject *base, byte *addressOfConstant, ScanRelocationKind code, intptr_t displacement);
-    void RelocateAddressAt(PolyWord *pt);
-    PolyObject *RelocateAddress(PolyObject *obj);
-    void AddTreeRange(SpaceBTree **t, unsigned index, uintptr_t startS, uintptr_t endS);
-
-    bool processCodeConstants;
-    PolyWord *originalBaseAddr;
-    SavedStateSegmentDescr *descrs;
-    PolyWord **targetAddresses;
-    unsigned nDescrs;
-    SpaceBTree *spaceTree;
-    intptr_t relativeOffset;
-};
-
-LoadRelocate::~LoadRelocate()
-{
-    if (descrs) delete[](descrs);
-    if (targetAddresses) delete[](targetAddresses);
-    delete(spaceTree);
-}
-
-// Add an entry to the space B-tree.
-void LoadRelocate::AddTreeRange(SpaceBTree **tt, unsigned index, uintptr_t startS, uintptr_t endS)
-{
-    if (*tt == 0)
-        *tt = new SpaceBTreeTree;
-    ASSERT(!(*tt)->isLeaf);
-    SpaceBTreeTree *t = (SpaceBTreeTree*)*tt;
-
-    const unsigned shift = (sizeof(void*) - 1) * 8; // Takes the high-order byte
-    uintptr_t r = startS >> shift;
-    ASSERT(r < 256);
-    const uintptr_t s = endS == 0 ? 256 : endS >> shift;
-    ASSERT(s >= r && s <= 256);
-
-    if (r == s) // Wholly within this entry
-        AddTreeRange(&(t->tree[r]), index, startS << 8, endS << 8);
-    else
-    {
-        // Deal with any remainder at the start.
-        if ((r << shift) != startS)
-        {
-            AddTreeRange(&(t->tree[r]), index, startS << 8, 0 /*End of range*/);
-            r++;
-        }
-        // Whole entries.
-        while (r < s)
-        {
-            ASSERT(t->tree[r] == 0);
-            t->tree[r] = new SpaceBTree(true, index);
-            r++;
-        }
-        // Remainder at the end.
-        if ((s << shift) != endS)
-            AddTreeRange(&(t->tree[r]), index, 0, endS << 8);
-    }
-}
-
-
-// Update the addresses in a group of words.
-void LoadRelocate::RelocateAddressAt(PolyWord *pt)
-{
-    PolyWord val = *pt;
-    if (! val.IsTagged())
-        *gMem.SpaceForAddress(pt)->writeAble(pt) = RelocateAddress(val.AsObjPtr(originalBaseAddr));
-}
-
-PolyObject *LoadRelocate::RelocateAddress(PolyObject *obj)
-{
-    // Which segment is this address in?
-    // N.B. As with SpaceForAddress we need to subtract 1 to point to the length word.
-    uintptr_t t = (uintptr_t)((PolyWord*)obj - 1);
-    SpaceBTree *tr = spaceTree;
-
-    // Each level of the tree is either a leaf or a vector of trees.
-    unsigned j = sizeof(void *) * 8;
-    for (;;)
-    {
-        if (tr == 0) break;
-        if (tr->isLeaf) {
-            // It's in this segment: relocate it to the current position.
-            unsigned i = tr->index;
-            SavedStateSegmentDescr *descr = &descrs[i];
-            PolyWord *newAddress = targetAddresses[descr->segmentIndex];
-            ASSERT((char*)obj > descr->originalAddress &&
-                (char*)obj <= (char*)descr->originalAddress + descr->segmentSize);
-            ASSERT(newAddress != 0);
-            byte *setAddress = (byte*)newAddress + ((char*)obj - (char*)descr->originalAddress);
-            return (PolyObject*)setAddress;
-        }
-        j -= 8;
-        tr = ((SpaceBTreeTree*)tr)->tree[(t >> j) & 0xff];
-    }
-
-    // This should never happen.
-    ASSERT(0);
-    return 0;
-}
-
-// This is based on Exporter::relocateObject but does the reverse.
-// It attempts to adjust all the addresses in the object when it has
-// been read in.
-void LoadRelocate::RelocateObject(PolyObject *p)
-{
-    if (p->IsByteObject())
-    {
-    }
-    else if (p->IsCodeObject())
-    {
-        POLYUNSIGNED constCount;
-        PolyWord *cp;
-        ASSERT(! p->IsMutable() );
-        machineDependent->GetConstSegmentForCode(p, cp, constCount);
-        /* Now the constant area. */
-        for (POLYUNSIGNED i = 0; i < constCount; i++) RelocateAddressAt(&(cp[i]));
-        // Saved states and modules have relocation entries for constants in the code.
-        // We can't use them when loading object files in 32-in-64 so have to process the
-        // constants here.
-        if (processCodeConstants)
-            machineDependent->ScanConstantsWithinCode(p, this);
-        // On 32-in-64 ARM we may have to update the global heap base in an FFI callback.
-        machineDependent->UpdateGlobalHeapReference(p);
-    }
-    else if (p->IsClosureObject())
-    {
-        // The first word is the address of the code.
-        POLYUNSIGNED length = p->Length();
-        *(PolyObject**)p = RelocateAddress(*(PolyObject**)p);
-        for (POLYUNSIGNED i = sizeof(PolyObject*)/sizeof(PolyWord); i < length; i++)
-            RelocateAddressAt(p->Offset(i));
-    }
-    else /* Ordinary objects, essentially tuples. */
-    {
-        POLYUNSIGNED length = p->Length();
-        for (POLYUNSIGNED i = 0; i < length; i++) RelocateAddressAt(p->Offset(i));
-    }
-}
-
-// Update addresses as constants within the code.
-void LoadRelocate::ScanConstant(PolyObject *base, byte *addressOfConstant, ScanRelocationKind code, intptr_t displacement)
-{
-    PolyObject *p = GetConstantValue(addressOfConstant, code, displacement);
-
-    if (p != 0)
-    {
-        // Relative addresses are computed by adding the CURRENT address.
-        // We have to convert them into addresses in original space before we
-        // can relocate them.
-        if (code == PROCESS_RELOC_I386RELATIVE)
-            p = (PolyObject*)((PolyWord*)p + relativeOffset);
-        PolyObject *newValue = RelocateAddress(p);
-        SetConstantValue(addressOfConstant, newValue, code);
-    }
-}
-
 // Work around bug in Mac OS when reading into MAP_JIT memory.
-static size_t readData(void *ptr, size_t size, FILE *stream)
+size_t readData(void *ptr, size_t size, FILE *stream)
 {
 #ifndef MACOSX
     return fread(ptr, size, 1, stream);
@@ -1100,9 +917,8 @@ static size_t readData(void *ptr, size_t size, FILE *stream)
 }
 
 // Load a saved state file.  Calls itself to handle parent files.
-bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
+bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail)
 {
-    LoadRelocate relocate;
     AutoFree<TCHAR*> thisFile(_tcsdup(fileName));
 
     AutoClose loadFile(_tfopen(fileName, _T("rb")));
@@ -1135,7 +951,7 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
 
     // Check that we have the required stamp before loading any children.
     // If a parent has been overwritten we could get a loop.
-    if (! isInitial && header.timeStamp != requiredStamp)
+    if (! isInitial && ModuleId(header.timeStamp) != requiredStamp)
     {
         // Time-stamps don't match.
         errorResult = "The parent for this saved state does not match or has been changed";
@@ -1193,7 +1009,7 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
                 return false;
         }
 
-        ASSERT(hierarchyDepth > 0 && hierarchyTable[hierarchyDepth-1] != 0);
+        ASSERT(hierarchyTable.size() > 0);
     }
     else // Top-level file
     {
@@ -1203,7 +1019,7 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
             errorResult = "Too many file names in the list";
             return false;
         }
-        if (header.parentTimeStamp != exportTimeStamp)
+        if (ModuleId(header.parentTimeStamp) != exportSignature)
         {
             // Time-stamp does not match executable.
             errorResult = 
@@ -1215,48 +1031,52 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
         // into local spaces.  We may have references from the stack to objects that
         // have previously been imported but otherwise these spaces are no longer
         // needed.
-        gMem.DemoteImportSpaces();
         // Clean out the hierarchy table.
-        for (unsigned h = 0; h < hierarchyDepth; h++)
-        {
-            delete(hierarchyTable[h]);
-            hierarchyTable[h] = 0;
-        }
-        hierarchyDepth = 0;
+        for (std::vector<HierarchyTable>::iterator i = hierarchyTable.begin(); i != hierarchyTable.end(); i++)
+            gMem.DemoteOldPermanentSpaces(i->timeStamp);
+
+        hierarchyTable.clear();
+
+        for (std::vector<LoadedModuleData>::iterator i = loadedModules.begin(); i != loadedModules.end(); i++)
+            gMem.DemoteOldPermanentSpaces(i->modId);
+
+        loadedModules.clear();
+
     }
 
     // Now have a valid, matching saved state.
     // Load the segment descriptors.
-    relocate.nDescrs = header.segmentDescrCount;
-    relocate.descrs = new SavedStateSegmentDescr[relocate.nDescrs];
-    relocate.originalBaseAddr = (PolyWord*)header.originalBaseAddr;
-
-    if (fseek(loadFile, header.segmentDescr, SEEK_SET) != 0 ||
-        fread(relocate.descrs, sizeof(SavedStateSegmentDescr), relocate.nDescrs, loadFile) != relocate.nDescrs)
+    std::vector<SavedStateSegmentDescr> descrs;
+    descrs.reserve(header.segmentDescrCount);
+    if (fseek(loadFile, header.segmentDescr, SEEK_SET) != 0)
     {
         errorResult = "Unable to read segment descriptors";
         return false;
     }
+    for (unsigned i = 0; i < header.segmentDescrCount; i++)
     {
-        unsigned maxIndex = 0;
-        for (unsigned i = 0; i < relocate.nDescrs; i++)
+        SavedStateSegmentDescr msd;
+        if (fread(&msd, sizeof(SavedStateSegmentDescr), 1, loadFile) != 1)
         {
-            if (relocate.descrs[i].segmentIndex > maxIndex)
-                maxIndex = relocate.descrs[i].segmentIndex;
-            relocate.AddTreeRange(&relocate.spaceTree, i, (uintptr_t)relocate.descrs[i].originalAddress,
-                (uintptr_t)((char*)relocate.descrs[i].originalAddress + relocate.descrs[i].segmentSize-1));
+            errorResult = "Unable to read segment descriptors";
+            return false;
         }
-        relocate.targetAddresses = new PolyWord*[maxIndex+1];
-        for (unsigned i = 0; i <= maxIndex; i++) relocate.targetAddresses[i] = 0;
+        descrs.push_back(msd);
     }
+
+    std::vector<StateLoadData> loadData;
+    loadData.reserve(header.segmentDescrCount);
 
     // Read in and create the new segments first.  If we have problems,
     // in particular if we have run out of memory, then it's easier to recover.  
-    for (unsigned i = 0; i < relocate.nDescrs; i++)
+    for (std::vector<SavedStateSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
     {
-        SavedStateSegmentDescr *descr = &relocate.descrs[i];
-        MemSpace *space = gMem.SpaceForIndex(descr->segmentIndex);
-        if (space != NULL) relocate.targetAddresses[descr->segmentIndex] = space->bottom;
+        MemSpace *space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleId);
+        StateLoadData load;
+        load.relocationCount = descr->relocationCount;
+        load.relocations = descr->relocations;
+        if (space != NULL) // An existing segment.  If it's mutable we might be overwriting it.
+            load.targetAddr = space->bottom;
 
         if (descr->segmentData == 0)
         { // No data - just an entry in the index.
@@ -1281,7 +1101,7 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
                 (descr->segmentFlags & SSF_BYTES ? MTF_BYTES : 0) |
                 (descr->segmentFlags & SSF_CODE ? MTF_EXECUTABLE : 0);
             PermanentMemSpace *newSpace =
-                gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, hierarchyDepth + 1);
+                gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, descr->moduleId);
             if (newSpace == 0)
             {
                 errorResult = "Unable to allocate memory";
@@ -1305,24 +1125,22 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
                 newSpace->spaceSize() - descr->segmentSize/sizeof(PolyWord));
             // Leave it writable until we've done the relocations.
 
-            relocate.targetAddresses[descr->segmentIndex] = mem;
             if (newSpace->noOverwrite)
             {
                 ClearVolatile cwbr;
                 cwbr.ScanAddressesInRegion(newSpace->bottom, newSpace->topPointer);
             }
+            load.targetAddr = newSpace->bottom;
         }
+        loadData.push_back(load);
     }
 
-    // Now read in the mutable overwrites and relocate.
-
-    for (unsigned j = 0; j < relocate.nDescrs; j++)
+    // Now read in the mutable overwrites.  This overwrites the muable areas with the values from the saved state.
+    for (std::vector<SavedStateSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
     {
-        SavedStateSegmentDescr *descr = &relocate.descrs[j];
-        MemSpace *space = gMem.SpaceForIndex(descr->segmentIndex);
-        ASSERT(space != NULL); // We should have created it.
         if (descr->segmentFlags & SSF_OVERWRITE)
         {
+            MemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleId);
             if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0 ||
                 fread(space->bottom, descr->segmentSize, 1, loadFile) != 1)
             {
@@ -1330,32 +1148,24 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
                 return false;
             }
         }
+    }
 
-        // Relocation.
-        if (descr->segmentData != 0)
-        {
-            // Adjust the addresses in the loaded segment.
-            for (PolyWord *p = space->bottom; p < space->top; )
-            {
-                p++;
-                PolyObject *obj = (PolyObject*)p;
-                POLYUNSIGNED length = obj->Length();
-                relocate.RelocateObject(obj);
-                p += length;
-            }
-        }
-
+    // Now the relocations.
+    for (std::vector<StateLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
+    {
+        PolyWord* baseAddr = i->targetAddr;
+        ASSERT(baseAddr != NULL); // We should have created it.
         // Process explicit relocations.
         // If we get errors just skip the error and continue rather than leave
         // everything in an unstable state.
-        if (descr->relocations)
+        if (i->relocations)
         {
-            if (fseek(loadFile, descr->relocations, SEEK_SET) != 0)
+            if (fseek(loadFile, i->relocations, SEEK_SET) != 0)
             {
                 errorResult = "Unable to read relocation segment";
                 return false;
             }
-            for (unsigned k = 0; k < descr->relocationCount; k++)
+            for (unsigned k = 0; k < i->relocationCount; k++)
             {
                 RelocationEntry reloc;
                 if (fread(&reloc, sizeof(reloc), 1, loadFile) != 1)
@@ -1363,38 +1173,15 @@ bool StateLoader::LoadFile(bool isInitial, time_t requiredStamp, PolyWord tail)
                     errorResult = "Unable to read relocation segment";
                     return false;
                 }
-                MemSpace *toSpace = gMem.SpaceForIndex(reloc.targetSegment);
-                if (toSpace == NULL)
-                {
-                    errorResult = "Unknown space reference in relocation";
-                    continue;
-                }
-                byte *setAddress = (byte*)space->bottom + reloc.relocAddress;
-                byte *targetAddress = (byte*)toSpace->bottom + reloc.targetAddress;
-                if (setAddress >= (byte*)space->top || targetAddress >= (byte*)toSpace->top)
-                {
-                    errorResult = "Bad relocation";
-                    continue;
-                }
+                byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
+                byte *targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
                 ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
             }
         }
     }
 
-    // Set the final permissions.
-    for (unsigned j = 0; j < relocate.nDescrs; j++)
-    {
-        SavedStateSegmentDescr *descr = &relocate.descrs[j];
-        if (descr->segmentData != 0)
-        {
-            PermanentMemSpace* space = gMem.SpaceForIndex(descr->segmentIndex);
-            gMem.CompletePermanentSpaceAllocation(space);
-        }
-    }
-
     // Add an entry to the hierarchy table for this file.
-    if (! AddHierarchyEntry(thisFile, header.timeStamp))
-        return false;
+    hierarchyTable.push_back(HierarchyTable(thisFile, header.timeStamp));
 
     return true; // Succeeded
 }
@@ -1436,6 +1223,7 @@ POLYUNSIGNED PolyLoadState(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     try {
         LoadState(taskData, false, pushedArg);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -1455,6 +1243,7 @@ POLYUNSIGNED PolyLoadHierarchy(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     try {
          LoadState(taskData, true, pushedArg);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -1469,16 +1258,22 @@ POLYUNSIGNED PolyLoadHierarchy(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 // These functions do not affect the global state so can be executed by
 // the ML threads directly.
 
-static Handle ShowHierarchy(TaskData *taskData)
-// Return the list of files in the hierarchy.
+static Handle moduleIdAsByteVector(TaskData* taskData, struct _moduleId modId);
+
+static Handle GetHierarchy(TaskData *taskData)
+// Return the list of files and module IDs in the hierarchy.
 {
     Handle saved = taskData->saveVec.mark();
     Handle list  = SAVE(ListNull);
 
     // Process this in reverse order.
-    for (unsigned i = hierarchyDepth; i > 0; i--)
+    for (std::vector<HierarchyTable>::reverse_iterator i = hierarchyTable.rbegin(); i != hierarchyTable.rend(); i++)
     {
-        Handle value = SAVE(C_string_to_Poly(taskData, hierarchyTable[i-1]->fileName));
+        Handle fName = SAVE(C_string_to_Poly(taskData, i->fileName.c_str()));
+        Handle modId = moduleIdAsByteVector(taskData, i->timeStamp);
+        Handle value = alloc_and_save(taskData, 2);
+        value->WordP()->Set(0, modId->Word());
+        value->WordP()->Set(1, fName->Word());
         Handle next  = alloc_and_save(taskData, sizeof(ML_Cons_Cell)/sizeof(PolyWord));
         DEREFLISTHANDLE(next)->h = value->Word();
         DEREFLISTHANDLE(next)->t = list->Word();
@@ -1488,8 +1283,8 @@ static Handle ShowHierarchy(TaskData *taskData)
     return list;
 }
 
-// Show the hierarchy.
-POLYUNSIGNED PolyShowHierarchy(POLYUNSIGNED threadId)
+// Return the file names and module IDs.
+POLYUNSIGNED PolyGetHierarchy(POLYUNSIGNED threadId)
 {
     TaskData *taskData = TaskData::FindTaskForId(threadId);
     ASSERT(taskData != 0);
@@ -1498,8 +1293,9 @@ POLYUNSIGNED PolyShowHierarchy(POLYUNSIGNED threadId)
     Handle result = 0;
 
     try {
-        result = ShowHierarchy(taskData);
+        result = GetHierarchy(taskData);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -1577,6 +1373,7 @@ POLYUNSIGNED PolyRenameParent(POLYUNSIGNED threadId, POLYUNSIGNED childName, POL
     try {
         RenameParent(taskData, PolyWord::FromUnsigned(childName), PolyWord::FromUnsigned(parentName));
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -1661,6 +1458,7 @@ POLYUNSIGNED PolyShowParent(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     try {
         result = ShowParent(taskData, pushedArg);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -1671,7 +1469,7 @@ POLYUNSIGNED PolyShowParent(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 
 // Module system
 #define MODULESIGNATURE "POLYMODU"
-#define MODULEVERSION   2
+#define MODULEVERSION   3
 
 typedef struct _moduleHeader
 {
@@ -1685,358 +1483,733 @@ typedef struct _moduleHeader
     // These entries contain the real data.
     off_t       segmentDescr;           // Position of segment descriptor table
     unsigned    segmentDescrCount;      // Number of segment descriptors in the table
-    time_t      timeStamp;              // The time stamp for this file.
-    time_t      executableTimeStamp;    // The time stamp for the parent executable.
+
+    struct _moduleId thisModuleId;      // The id for this module.
+    struct _moduleId executableModId;    // The id for the parent executable.
+
+    off_t       stringTable;            // Pointer to the string table (zero if none)
+    size_t      stringTableSize;        // Size of string table
+
+    off_t       dependencies;           // Location of dependency table, if any
+    unsigned    dependencyCount;
+
     // Root
     uintptr_t   rootSegment;
     POLYUNSIGNED     rootOffset;
 } ModuleHeader;
 
-// Store a module
-class ModuleStorer: public MainThreadRequest
+// Entry for segment table.  This describes the segments on the disc that
+// need to be loaded into memory.
+typedef struct _moduleSegmentDescr
+{
+    off_t       segmentData;            // Position of the segment data
+    size_t      segmentSize;            // Size of the segment data
+    off_t       relocations;            // Position of the relocation table
+    unsigned    relocationCount;        // Number of entries in relocation table
+    unsigned    relocationSize;         // Size of a relocation entry
+    unsigned    segmentFlags;           // Segment flags (see MSF_ values)
+    unsigned    segmentIndex;           // The index of this segment or the segment it overwrites
+    struct _moduleId moduleIden;               // The module this came from.
+} ModuleSegmentDescr;
+
+#define MSF_WRITABLE    1               // The segment contains mutable data
+#define MSF_OVERWRITE   2               // The segment overwrites the data (mutable) in a parent.
+#define MSF_NOOVERWRITE 4               // The segment must not be further overwritten
+#define MSF_BYTES       8               // The segment contains only byte data
+#define MSF_CODE        16              // The segment contains only code
+
+typedef struct _modrelocationEntry
+{
+    // Each entry indicates a location that has to be set to an address.
+    // The location to be set is determined by adding "relocAddress" to the base address of
+    // this segment (the one to which these relocations apply) and the value to store
+    // by adding "targetAddress" to the base address of the segment indicated by "targetSegment".
+    POLYUNSIGNED    relocAddress;       // The (byte) offset in this segment that we will set
+    POLYUNSIGNED    targetAddress;      // The value to add to the base of the destination segment
+    unsigned        targetSegment;      // Index into the address table
+    ScanRelocationKind relKind;         // The kind of relocation (processor dependent).
+} ModRelocationEntry;
+
+// Entry for a dependency.  This is really a guide to help to load the dependencies
+// automatically.  The segment table is used to check that the memory segment needed
+// have actually been loaded.
+typedef struct _modDependencyEntry
+{
+    unsigned            depNameEntry;   // Index into the string table for the name
+    struct _moduleId    depId;          // Id for this dependency
+} ModDependencyEntry;
+
+class ModuleExporter : public MainThreadRequest, public StateExport
 {
 public:
-    ModuleStorer(const TCHAR *file, Handle r):
-        MainThreadRequest(MTP_STOREMODULE), fileName(file), root(r), errorMessage(0), errCode(0) {}
+    ModuleExporter(const TCHAR* file, Handle r) :
+        MainThreadRequest(MTP_STOREMODULE), fileName(file), root(r), relocationCount(0) {
+    }
 
     virtual void Perform();
 
-    const TCHAR *fileName;
+    const TCHAR* fileName;
     Handle root;
-    const char *errorMessage;
-    int errCode;
+
+    std::vector<ModIdAndName> dependencies;
+
+    void RunModuleExport(PolyObject* rootFunction);
+    virtual void exportStore(void) {}
+
+protected:
+    void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
+    unsigned relocationCount;
+
+    friend class SaveRequest;
 };
 
-class ModuleExport: public SaveStateExport
+// Create a relocation entry for an address at a given location.
+// In compact-32 bit mode this will only be called for modules.
+void ModuleExporter::createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind)
 {
-public:
-    ModuleExport(): SaveStateExport(1/* Everything EXCEPT the executable. */) {}
-    virtual void exportStore(void); // Write the data out.
-};
+    ModRelocationEntry reloc;
+    // Set the offset within the section we're scanning.
+    setRelocationAddress(relocAddr, &reloc.relocAddress);
 
-void ModuleStorer::Perform()
-{
-    ModuleExport exporter;
-#if (defined(_WIN32) && defined(UNICODE))
-    exporter.exportFile = _wfopen(fileName, L"wb");
-#else
-    exporter.exportFile = fopen(fileName, "wb");
-#endif
-    if (exporter.exportFile == NULL)
-    {
-        errorMessage = "Cannot open export file";
-        errCode = ERRORNUMBER;
-        return;
-    }
-    // RunExport copies everything reachable from the root, except data from
-    // the executable because we've set the hierarchy to 1, using CopyScan.
-    // It builds the tables in the export data structure then calls exportStore
-    // to actually write the data.
-    if (! root->Word().IsDataPtr())
-    {
-        // If we have a completely empty module the list may be null.
-        // This needs to be dealt with at a higher level.
-        errorMessage = "Module root is not an address";
-        return;
-    }
-    exporter.RunExport(root->WordP());
-    errorMessage = exporter.errorMessage; // This will be null unless there's been an error.
+    unsigned addrArea = findArea(addr);
+    reloc.targetAddress = (POLYUNSIGNED)((char*)addr - (char*)memTable[addrArea].mtOriginalAddr);
+    reloc.targetSegment = addrArea;
+    reloc.relKind = kind;
+    fwrite(&reloc, sizeof(reloc), 1, exportFile);
+    relocationCount++;
 }
 
-void ModuleExport::exportStore(void)
+// This is called by the initial thread to actually do the export.
+void ModuleExporter::RunModuleExport(PolyObject* rootFn)
 {
-    // What we need to do here is implement the export in a similar way to e.g. PECOFFExport::exportStore
-    // This is copied from SaveRequest::Perform and should be common code.
-    ModuleHeader modHeader;
-    memset(&modHeader, 0, sizeof(modHeader));
-    modHeader.headerLength = sizeof(modHeader);
-    memcpy(modHeader.headerSignature,
-        MODULESIGNATURE, sizeof(modHeader.headerSignature));
-    modHeader.headerVersion = MODULEVERSION;
-    modHeader.segmentDescrLength = sizeof(SavedStateSegmentDescr);
-    modHeader.executableTimeStamp = exportTimeStamp;
-    {
-        unsigned rootArea = findArea(this->rootFunction);
-        struct _memTableEntry *mt = &memTable[rootArea];
-        modHeader.rootSegment = mt->mtIndex;
-        modHeader.rootOffset = (POLYUNSIGNED)((char*)this->rootFunction - (char*)mt->mtOriginalAddr);
-    }
-    modHeader.timeStamp = getBuildTime();
-    modHeader.segmentDescrCount = this->memTableEntries; // One segment for each space.
-    // Write out the header.
-    fwrite(&modHeader, sizeof(modHeader), 1, this->exportFile);
+    PolyObject* copiedRoot = 0;
+    CopyScan copyScan;
 
-    SavedStateSegmentDescr *descrs = new SavedStateSegmentDescr [this->memTableEntries];
-    // We need an entry in the descriptor tables for each segment in the executable because
-    // we may have relocations that refer to addresses in it.
-    for (unsigned j = 0; j < this->memTableEntries; j++)
+    // Set the dependencies.  These are included first since the caller may have provided names.
+    copyScan.dependencies[exportSignature] = true; // Always include the executable
+    for (std::vector<ModIdAndName>::iterator i = dependencies.begin(); i < dependencies.end(); i++)
+        copyScan.dependencies[i->modId] = true;
+    // Add any further dependencies to produce the transitive closure.
+    // Can't use an iterator here because the size may increase.  Actually, every dependency will
+    // already include the transitive closure of its dependencies so it isn't necessary to look
+    // deeper.
+    for (std::vector<ModIdAndName>::size_type i = 0; i < dependencies.size(); i++)
     {
-        SavedStateSegmentDescr *thisDescr = &descrs[j];
-        memoryTableEntry *entry = &this->memTable[j];
-        memset(thisDescr, 0, sizeof(SavedStateSegmentDescr));
-        thisDescr->relocationSize = sizeof(RelocationEntry);
-        thisDescr->segmentIndex = (unsigned)entry->mtIndex;
-        thisDescr->segmentSize = entry->mtLength; // Set this even if we don't write it.
-        thisDescr->originalAddress = entry->mtOriginalAddr;
-        if (entry->mtFlags & MTF_WRITEABLE)
+        if (dependencies[i].isModule)
         {
-            thisDescr->segmentFlags |= SSF_WRITABLE;
-            if (entry->mtFlags & MTF_NO_OVERWRITE)
-                thisDescr->segmentFlags |= SSF_NOOVERWRITE;
-            if ((entry->mtFlags & MTF_NO_OVERWRITE) == 0)
-                thisDescr->segmentFlags |= SSF_OVERWRITE;
-            if (entry->mtFlags & MTF_BYTES)
-                thisDescr->segmentFlags |= SSF_BYTES;
-        }
-        if (entry->mtFlags & MTF_EXECUTABLE)
-             thisDescr->segmentFlags |= SSF_CODE;
-    }
-    // Write out temporarily. Will be overwritten at the end.
-    modHeader.segmentDescr = ftell(this->exportFile);
-    fwrite(descrs, sizeof(SavedStateSegmentDescr), this->memTableEntries, this->exportFile);
-
-    // Write out the relocations and the data.
-    for (unsigned k = 0; k < this->memTableEntries; k++)
-    {
-        SavedStateSegmentDescr *thisDescr = &descrs[k];
-        memoryTableEntry *entry = &this->memTable[k];
-        if (k >= newAreas) // Not permanent areas
-        {
-            thisDescr->relocations = ftell(this->exportFile);
-            // Have to write this out.
-            this->relocationCount = 0;
-            // Create the relocation table.
-            char *start = (char*)entry->mtOriginalAddr;
-            char *end = start + entry->mtLength;
-            for (PolyWord *p = (PolyWord*)start; p < (PolyWord*)end; )
+            ModuleId m = dependencies[i].modId;
+            for (std::vector<LoadedModuleData>::const_iterator j = loadedModules.cbegin(); j != loadedModules.cend(); j++)
             {
-                p++;
-                PolyObject *obj = (PolyObject*)p;
-                POLYUNSIGNED length = obj->Length();
-                // For saved states we don't include explicit relocations except
-                // in code but it's easier if we do for modules.
-                if (length != 0 && obj->IsCodeObject())
-                    machineDependent->ScanConstantsWithinCode(obj, this);
-                relocateObject(obj);
-                p += length;
+                // Find the entry in the loaded module table.  It should be there somewhere.
+                if (j->modId == m)
+                {
+                    // Add all the dependencies if they're not already there.
+                    for (std::vector<ModuleId>::const_iterator k = j->modDependencies.cbegin(); k < j->modDependencies.cend(); k++)
+                    {
+                        if (!copyScan.dependencies[k->modId])
+                        {
+                            ModIdAndName m(_T(""), k->modId, true);
+                            // Add this to the end.  It will be processed later but the sub-dependencies should already be there.
+                            dependencies.push_back(m);
+                            copyScan.dependencies[k->modId] = true; // Don't need to add it again.
+                        }
+                    }
+
+                    break; // Don't need to search further
+                }
             }
-            thisDescr->relocationCount = this->relocationCount;
-            // Write out the data.
-            thisDescr->segmentData = ftell(exportFile);
-            fwrite(entry->mtOriginalAddr, entry->mtLength, 1, exportFile);
+        }
+        else
+        {
+            ModuleId m = dependencies[i].modId;
+            // Add all the saved states at this and higher levels since any data in these levels should be
+            // referenced rather than copied.  The entry should be there because we've already checked.
+            for (std::vector <HierarchyTable>::iterator i = hierarchyTable.begin(); i < hierarchyTable.end(); i++)
+            {
+                copyScan.dependencies[i->timeStamp] = true;
+                if (m == i->timeStamp)
+                    break;
+            }
         }
     }
 
-    // Rewrite the header and the segment tables now they're complete.
-    fseek(exportFile, 0, SEEK_SET);
-    fwrite(&modHeader, sizeof(modHeader), 1, exportFile);
-    fwrite(descrs, sizeof(SavedStateSegmentDescr), this->memTableEntries, exportFile);
-    delete[](descrs);
+    try {
+        copyScan.initialise();
+        // Copy the root and everything reachable from it into the temporary area.
+        copiedRoot = copyScan.ScanObjectAddress(rootFn);
+        // Fix the permanent areas.  We may have copied cells from modules if they are
+        // not dependencies.
+        CopyScan::fixPermanentAreas();
+    }
+    catch (MemoryException&)
+    {
+        errorMessage = "Insufficient Memory";
+        // Reset the forwarding pointers so that the original data structure is in
+        // local storage.
+        CopyScan::revertToLocal();
+        return;
+    }
 
-    fclose(exportFile); exportFile = NULL;
+    exportModId = copyScan.extractHash();
+
+    // Copy the areas into the export object.
+    size_t tableSize = gMem.eSpaces.size() + gMem.pSpaces.size();
+    unsigned memEntry = 0;
+    memTable = new ExportMemTable[tableSize];
+
+    // If we're constructing a module we need to include the global spaces.
+    // Permanent spaces from the dependencies
+    for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
+    {
+        PermanentMemSpace* space = *i;
+        if (copyScan.dependencies[space->moduleIdentifier])
+        {
+            ExportMemTable* entry = &memTable[memEntry++];
+            entry->mtOriginalAddr = entry->mtCurrentAddr = space->bottom;
+            entry->mtLength = (space->topPointer - space->bottom) * sizeof(PolyWord);
+            entry->mtIndex = space->index;
+            entry->mtModId = space->moduleIdentifier;
+            entry->mtFlags = 0;
+            if (space->isMutable) entry->mtFlags |= MTF_WRITEABLE;
+            if (space->isCode) entry->mtFlags |= MTF_EXECUTABLE;
+        }
+    }
+    unsigned newAreas = memEntry;
+
+    for (std::vector<PermanentMemSpace*>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
+    {
+        ExportMemTable* entry = &memTable[memEntry++];
+        PermanentMemSpace* space = *i;
+        entry->mtOriginalAddr = entry->mtCurrentAddr = space->bottom;
+        entry->mtLength = (space->topPointer - space->bottom) * sizeof(PolyWord);
+        // The spaces need to be renumbered and the module id set.
+        space->index = memEntry - newAreas - 1;
+        space->moduleIdentifier = ModuleId(exportModId);
+        entry->mtIndex = space->index;
+        entry->mtModId = space->moduleIdentifier;
+        entry->mtFlags = 0;
+        if (space->isMutable)
+        {
+            entry->mtFlags = MTF_WRITEABLE;
+            if (space->noOverwrite) entry->mtFlags |= MTF_NO_OVERWRITE;
+        }
+        if (space->isCode && !space->constArea) entry->mtFlags |= MTF_EXECUTABLE;
+        if (space->byteOnly) entry->mtFlags |= MTF_BYTES;
+    }
+
+    ASSERT(memEntry <= tableSize);
+    memTableEntries = memEntry;
+    rootFunction = copiedRoot;
+
+    // Write the data out.  This handles memory exceptions but we should also
+    // handle write failures.  That could happen if the disc became full.
+    try {
+        ModuleHeader modHeader;
+        memset(&modHeader, 0, sizeof(modHeader));
+        modHeader.headerLength = sizeof(modHeader);
+        memcpy(modHeader.headerSignature,
+            MODULESIGNATURE, sizeof(modHeader.headerSignature));
+        modHeader.headerVersion = MODULEVERSION;
+        modHeader.segmentDescrLength = sizeof(ModuleSegmentDescr);
+        modHeader.executableModId = exportSignature;
+        {
+            unsigned rootArea = findArea(this->rootFunction);
+            ExportMemTable* mt = &memTable[rootArea];
+            modHeader.rootSegment = rootArea;
+            modHeader.rootOffset = (POLYUNSIGNED)((char*)this->rootFunction - (char*)mt->mtOriginalAddr);
+        }
+        modHeader.thisModuleId = exportModId;
+        modHeader.segmentDescrCount = this->memTableEntries; // One segment for each space.
+        // Write out the header.
+        if (!checkedFwrite(&modHeader, sizeof(modHeader), 1))
+            throw IOException();
+
+        std::vector<ModuleSegmentDescr> descrs;
+        descrs.reserve(this->memTableEntries);
+        // We need an entry in the descriptor tables for each segment in the executable because
+        // we may have relocations that refer to addresses in it.
+        for (unsigned j = 0; j < this->memTableEntries; j++)
+        {
+            ModuleSegmentDescr thisDescr;;
+            ExportMemTable* entry = &this->memTable[j];
+            memset(&thisDescr, 0, sizeof(ModuleSegmentDescr));
+            thisDescr.relocationSize = sizeof(ModRelocationEntry);
+            thisDescr.segmentIndex = entry->mtIndex;
+            thisDescr.segmentSize = entry->mtLength; // Set this even if we don't write it.
+            thisDescr.moduleIden = entry->mtModId;
+            if (entry->mtFlags & MTF_WRITEABLE)
+            {
+                thisDescr.segmentFlags |= MSF_WRITABLE;
+                if (entry->mtFlags & MTF_NO_OVERWRITE)
+                    thisDescr.segmentFlags |= MSF_NOOVERWRITE;
+                if ((entry->mtFlags & MTF_NO_OVERWRITE) == 0)
+                    thisDescr.segmentFlags |= MSF_OVERWRITE;
+                if (entry->mtFlags & MTF_BYTES)
+                    thisDescr.segmentFlags |= MSF_BYTES;
+            }
+            if (entry->mtFlags & MTF_EXECUTABLE)
+                thisDescr.segmentFlags |= MSF_CODE;
+            descrs.push_back(thisDescr);
+        }
+        // Write out temporarily. Will be overwritten at the end.
+        modHeader.segmentDescr = ftell(this->exportFile);
+        if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
+            throw IOException();
+
+        // Write out the relocations and the data.
+        for (unsigned k = 0; k < this->memTableEntries; k++)
+        {
+            ModuleSegmentDescr* thisDescr = &descrs[k];
+            ExportMemTable* entry = &this->memTable[k];
+            if (k >= newAreas) // Not permanent areas
+            {
+                thisDescr->relocations = ftell(this->exportFile);
+                // Have to write this out.
+                this->relocationCount = 0;
+                // Create the relocation table.
+                char* start = (char*)entry->mtOriginalAddr;
+                char* end = start + entry->mtLength;
+                for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+                {
+                    p++;
+                    PolyObject* obj = (PolyObject*)p;
+                    POLYUNSIGNED length = obj->Length();
+                    // For saved states we don't include explicit relocations except
+                    // in code but it's easier if we do for modules.
+                    if (length != 0 && obj->IsCodeObject())
+                        machineDependent->ScanConstantsWithinCode(obj, this);
+                    relocateObject(obj);
+                    p += length;
+                }
+                thisDescr->relocationCount = this->relocationCount;
+                // Write out the data.
+                thisDescr->segmentData = ftell(exportFile);
+                if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
+                    throw IOException();
+            }
+        }
+        // Write the string table and construct the dependency table at the same time
+        std::vector<ModDependencyEntry> dependencyTable;
+
+        modHeader.stringTable = ftell(exportFile);
+        unsigned stringPos = 0;
+        _fputtc(0, exportFile); // First byte of string table is zero
+        stringPos += sizeof(TCHAR);
+        for (std::vector<ModIdAndName>::iterator i = dependencies.begin(); i < dependencies.end(); i++)
+        {
+            ModDependencyEntry depEntry;
+            depEntry.depNameEntry = stringPos;
+            _fputts(i->modName.c_str(), exportFile);
+            stringPos += (unsigned)(i->modName.size() * sizeof(TCHAR));
+            _fputtc(0, exportFile); // A terminating null.
+            stringPos += sizeof(TCHAR);
+            depEntry.depId = i->modId;
+            dependencyTable.push_back(depEntry);
+        }
+
+        modHeader.stringTableSize = stringPos;
+        if (ferror(exportFile))
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Error while writing string table";
+            throw IOException();
+        }
+        // And the dependency table itself if needed.
+        if (!dependencyTable.empty())
+        {
+            modHeader.dependencies = ftell(exportFile);
+            modHeader.dependencyCount = (unsigned)dependencyTable.size();
+            if (!checkedFwrite(dependencyTable.data(), sizeof(ModDependencyEntry), dependencyTable.size()))
+                throw IOException();
+        }
+
+        // Rewrite the header and the segment tables now they're complete.
+        fseek(exportFile, 0, SEEK_SET);
+        if (!checkedFwrite(&modHeader, sizeof(modHeader), 1))
+            throw IOException();
+        if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
+            throw IOException();
+
+        fclose(exportFile); exportFile = NULL;
+
+        // Add this to the loaded module table.
+        LoadedModuleData loadMod;
+        loadMod.modId = exportModId;
+        loadMod.modDependencies.resize(dependencies.size());
+        for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
+            loadMod.modDependencies.push_back(i->modId);
+        loadedModules.push_back(loadMod);
+
+        // If it all succeeded we can switch over to the permanent spaces.
+        if (gMem.PromoteNewExportSpaces(exportModId))
+            switchLocalsToPermanent();
+        else CopyScan::revertToLocal();
+
+    }
+    catch (IOException&)
+    {
+        CopyScan::revertToLocal();
+    }
+    catch (MemoryException&) {
+        errorMessage = "Insufficient Memory";
+        CopyScan::revertToLocal();
+    }
+}
+
+void ModuleExporter::Perform()
+{
+    try {
+#if (defined(_WIN32) && defined(UNICODE))
+        exportFile = _wfopen(fileName, L"wb");
+#else
+        exportFile = fopen(fileName, "wb");
+#endif
+        if (exportFile == NULL)
+        {
+            errorMessage = "Cannot open export file";
+            errNumber = ERRORNUMBER;
+            return;
+        }
+        // RunExport copies everything reachable from the root, except data from
+        // the executable because we've set the hierarchy to 1, using CopyScan.
+        // It builds the tables in the export data structure then calls exportStore
+        // to actually write the data.
+        if (!root->Word().IsDataPtr())
+        {
+            // If we have a completely empty module the list may be null.
+            // This needs to be dealt with at a higher level.
+            errorMessage = "Module root is not an address";
+            return;
+        }
+        RunModuleExport(root->WordP());
+    }
+    catch (const std::bad_alloc&)
+    {
+        errorMessage = "Insufficient Memory : C++ allocation failed";
+    }
+}
+
+// Return a module Id as a string.  Also used in saved state.
+static Handle moduleIdAsByteVector(TaskData* taskData, struct _moduleId modId)
+{
+    union {
+        struct _moduleId mId;
+        char chars[sizeof(struct _moduleId)];
+    } asVector;
+    asVector.mId = modId;
+    // Convert the module Id to a vector of bytes.  The representation is the same as a string.
+    return taskData->saveVec.push(C_string_to_Poly(taskData, asVector.chars, sizeof(struct _moduleId)));
+}
+
+static ModuleId moduleIdFromByteVector(TaskData* taskData, PolyWord p)
+{
+    union {
+        struct _moduleId mId;
+        char chars[sizeof(struct _moduleId)];
+    } asVector;
+    // Extract the module Id which is in Word8Vector.vector object.
+    PolyStringObject* str = (PolyStringObject*)p.AsObjPtr();
+    if (str->length != sizeof(struct _moduleId))
+        raise_fail(taskData, "Incorrect format for module ID");
+    memcpy(asVector.chars, str->chars, sizeof(struct _moduleId));
+    return ModuleId(asVector.mId);
 }
 
 // Store a module
-POLYUNSIGNED PolyStoreModule(POLYUNSIGNED threadId, POLYUNSIGNED name, POLYUNSIGNED contents)
+POLYUNSIGNED PolyStoreModule(POLYUNSIGNED threadId, POLYUNSIGNED filename, POLYUNSIGNED contents, POLYUNSIGNED depends)
 {
-    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
     ASSERT(taskData != 0);
     taskData->PreRTSCall();
     Handle reset = taskData->saveVec.mark();
     Handle pushedContents = taskData->saveVec.push(contents);
+    Handle result = 0;
 
     try {
-        TempString fileName(PolyWord::FromUnsigned(name));
-        ModuleStorer storer(fileName, pushedContents);
+        TempString fileName(PolyWord::FromUnsigned(filename));
+        ModuleExporter storer(fileName, pushedContents);
+
+        // Process the list of dependencies.  It is a list of moduleId*string pairs.
+        for (PolyWord l = PolyWord::FromUnsigned(depends); l.IsDataPtr(); l = ((ML_Cons_Cell*)l.AsObjPtr())->t)
+        {
+            PolyObject* p = ((ML_Cons_Cell*)l.AsObjPtr())->h.AsObjPtr();
+            ModuleId mId = moduleIdFromByteVector(taskData, p->Get(0));
+            // See if this is a module or a saved state.
+            std::vector<LoadedModuleData>::iterator i = loadedModules.begin();
+            while (i != loadedModules.end())
+            {
+                if (i->modId == mId)
+                {
+                    ModIdAndName mn(PolyStringToTString(p->Get(1)), mId, true);
+                    storer.dependencies.push_back(mn);
+                    break;
+                }
+                i++;
+            }
+            if (i == loadedModules.end())
+            {
+                std::vector<HierarchyTable>::iterator j = hierarchyTable.begin();
+                while (j != hierarchyTable.end())
+                {
+                    if (ModuleId(j->timeStamp) == mId)
+                    {
+                        // Set the name to the empty string.  We cannot auto-load a saved state.
+                        ModIdAndName mn(_T(""), mId, false);
+                        storer.dependencies.push_back(mn);
+                        break;
+                    }
+                    j++;
+                }
+                if (j == hierarchyTable.end())
+                    raise_fail(taskData, "A dependency is listed but the module is not loaded");
+            }
+        }
+
         processes->MakeRootRequest(taskData, &storer);
         if (storer.errorMessage)
-            raise_syscall(taskData, storer.errorMessage, storer.errCode);
+            raise_syscall(taskData, storer.errorMessage, storer.errNumber);
+
+        result = moduleIdAsByteVector(taskData, storer.getExportId());
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
     taskData->PostRTSCall();
-    return TAGGED(0).AsUnsigned();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
 }
 
 // Load a module.
-class ModuleLoader: public MainThreadRequest
+class ModuleLoader : public MainThreadRequest
 {
 public:
-    ModuleLoader(TaskData *taskData, const TCHAR *file):
+    ModuleLoader(TaskData* taskData, const std_tstring file) :
         MainThreadRequest(MTP_LOADMODULE), callerTaskData(taskData), fileName(file),
-            errorResult(NULL), errNumber(0), rootHandle(0) {}
+        errorResult(NULL), errNumber(0), rootHandle(0) {
+    }
 
     virtual void Perform();
 
-    TaskData *callerTaskData;
-    const TCHAR *fileName;
-    const char *errorResult;
+    TaskData* callerTaskData;
+    std_tstring fileName;
+    const char* errorResult;
     int errNumber;
     Handle rootHandle;
+    ModuleId loadedModId;
+};
+
+// Data needed for relocation during load.
+class ModuleLoadData {
+public:
+    ModuleLoadData() : relocations(0), relocationCount(0), targetAddr(0) {}
+
+    off_t       relocations;        // Copied from descriptor
+    unsigned    relocationCount;
+    PolyWord* targetAddr;           // Actual address of the segment
 };
 
 void ModuleLoader::Perform()
 {
-    AutoClose loadFile(_tfopen(fileName, _T("rb")));
-    if ((FILE*)loadFile == NULL)
-    {
-        errorResult = "Cannot open load file";
-        errNumber = ERRORNUMBER;
-        return;
-    }
-
-    ModuleHeader header;
-    // Read the header and check the signature.
-    if (fread(&header, sizeof(ModuleHeader), 1, loadFile) != 1)
-    {
-        errorResult = "Unable to load header";
-        return;
-    }
-    if (strncmp(header.headerSignature, MODULESIGNATURE, sizeof(header.headerSignature)) != 0)
-    {
-        errorResult = "File is not a Poly/ML module";
-        return;
-    }
-    if (header.headerVersion != MODULEVERSION ||
-        header.headerLength != sizeof(ModuleHeader) ||
-        header.segmentDescrLength != sizeof(SavedStateSegmentDescr))
-    {
-        errorResult = "Unsupported version of module file";
-        return;
-    }
-    if (header.executableTimeStamp != exportTimeStamp)
-    {
-        // Time-stamp does not match executable.
-        errorResult = 
-                "Module was exported from a different executable or the executable has changed";
-        return;
-    }
-    LoadRelocate relocate;
-    relocate.nDescrs = header.segmentDescrCount;
-    relocate.descrs = new SavedStateSegmentDescr[relocate.nDescrs];
-
-    if (fseek(loadFile, header.segmentDescr, SEEK_SET) != 0 ||
-        fread(relocate.descrs, sizeof(SavedStateSegmentDescr), relocate.nDescrs, loadFile) != relocate.nDescrs)
-    {
-        errorResult = "Unable to read segment descriptors";
-        return;
-    }
-    {
-        unsigned maxIndex = 0;
-        for (unsigned i = 0; i < relocate.nDescrs; i++)
-            if (relocate.descrs[i].segmentIndex > maxIndex)
-                maxIndex = relocate.descrs[i].segmentIndex;
-        relocate.targetAddresses = new PolyWord*[maxIndex+1];
-        for (unsigned i = 0; i <= maxIndex; i++) relocate.targetAddresses[i] = 0;
-    }
-
-    // Read in and create the new segments first.  If we have problems,
-    // in particular if we have run out of memory, then it's easier to recover.  
-    for (unsigned i = 0; i < relocate.nDescrs; i++)
-    {
-        SavedStateSegmentDescr *descr = &relocate.descrs[i];
-        MemSpace *space = gMem.SpaceForIndex(descr->segmentIndex);
-
-        if (descr->segmentData == 0)
-        { // No data - just an entry in the index.
-            if (space == NULL/* ||
-                descr->segmentSize != (size_t)((char*)space->top - (char*)space->bottom)*/)
-            {
-                errorResult = "Mismatch for existing memory space";
-                return;
-            }
-            else relocate.targetAddresses[descr->segmentIndex] = space->bottom;
+    try {
+        AutoClose loadFile(_tfopen(fileName.c_str(), _T("rb")));
+        if ((FILE*)loadFile == NULL)
+        {
+            errorResult = "Cannot open load file";
+            errNumber = ERRORNUMBER;
+            return;
         }
-        else
-        { // New segment.
-            if (space != NULL)
+
+        ModuleHeader header;
+        // Read the header and check the signature.
+        if (fread(&header, sizeof(ModuleHeader), 1, loadFile) != 1)
+        {
+            errorResult = "Unable to load header";
+            return;
+        }
+        if (strncmp(header.headerSignature, MODULESIGNATURE, sizeof(header.headerSignature)) != 0)
+        {
+            errorResult = "File is not a Poly/ML module";
+            return;
+        }
+        if (header.headerVersion != MODULEVERSION ||
+            header.headerLength != sizeof(ModuleHeader) ||
+            header.segmentDescrLength != sizeof(ModuleSegmentDescr))
+        {
+            errorResult = "Unsupported version of module file";
+            return;
+        }
+        // Check to see if this is already loaded
+        for (std::vector<LoadedModuleData>::iterator i = loadedModules.begin(); i < loadedModules.end(); i++)
+        {
+            if (i->modId == header.thisModuleId)
             {
-                errorResult = "Segment already exists";
+                errorResult = "A module with this signature is already loaded";
                 return;
             }
-            // Allocate memory for the new segment.
-            size_t actualSize = descr->segmentSize;
-            MemSpace *space;
-            if (descr->segmentFlags & SSF_CODE)
+        }
+        if (ModuleId(header.executableModId) != exportSignature)
+        {
+            // Time-stamp does not match executable.
+            errorResult =
+                "Module was exported from a different executable or the executable has changed";
+            return;
+        }
+
+        // Add to the loaded module table
+        LoadedModuleData loadMod;
+        loadMod.modId = header.thisModuleId;
+        loadMod.modDependencies.resize(header.dependencyCount);
+
+        // Get the dependencies.  This is only needed to fill in the dependency vector.
+        if (fseek(loadFile, header.dependencies, SEEK_SET) != 0)
+        {
+            errorResult = "Unable to access dependency table";
+            return;
+        }
+        for (unsigned i = 0; i < header.dependencyCount; i++)
+        {
+            ModDependencyEntry modDepEntry;
+            if (fread(&modDepEntry, sizeof(ModDependencyEntry), 1, loadFile) != 1)
             {
-                CodeSpace *cSpace = gMem.NewCodeSpace(actualSize);
-                if (cSpace == 0)
+                errorResult = "Unable to load dependency entry";
+                return;
+            }
+            loadMod.modDependencies.push_back(modDepEntry.depId);
+        }
+
+        // We could check the dependency table at this point but other than perhaps improving
+        // the error message if a dependency is missing there's no point.
+
+        // Read all the descriptors first.  We need to be able to seek to the actual data for
+        // each space as we create them.
+        std::vector<ModuleSegmentDescr> descrs;
+        descrs.reserve(header.segmentDescrCount);
+        if (fseek(loadFile, header.segmentDescr, SEEK_SET) != 0)
+        {
+            errorResult = "Unable to read segment descriptors";
+            return;
+        }
+        for (unsigned i = 0; i < header.segmentDescrCount; i++)
+        {
+            ModuleSegmentDescr msd;
+            if (fread(&msd, sizeof(ModuleSegmentDescr), 1, loadFile) != 1)
+            {
+                errorResult = "Unable to read segment descriptors";
+                return;
+            }
+            descrs.push_back(msd);
+        }
+
+        std::vector<ModuleLoadData> loadData;
+        loadData.reserve(header.segmentDescrCount);
+
+        // Read in and create the new segments first.  If we have problems,
+        // in particular if we have run out of memory, then it's easier to recover.
+        for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
+        {
+            MemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleIden);
+            ModuleLoadData load;
+            load.relocationCount = descr->relocationCount;
+            load.relocations = descr->relocations;
+
+            if (descr->segmentData == 0)
+            { // No data - just an entry in the index.
+                if (space == NULL)
                 {
-                    errorResult = "Unable to allocate memory";
+                    errorResult = "Required memory space is not present";
                     return;
                 }
-                space = cSpace;
-                cSpace->firstFree = (PolyWord*)((byte*)space->bottom + descr->segmentSize);
-                if (cSpace->firstFree != cSpace->top)
-                    gMem.FillUnusedSpace(cSpace->firstFree, cSpace->top - cSpace->firstFree);
+                load.targetAddr = space->bottom;
             }
             else
-            {
-                LocalMemSpace *lSpace = gMem.NewLocalSpace(actualSize, descr->segmentFlags & SSF_WRITABLE);
-                if (lSpace == 0)
+            { // New segment.
+                if (space != NULL)
+                {
+                    errorResult = "Memory space with this signature already exists";
+                    return;
+                }
+                // Allocate memory for the new segment.
+                unsigned mFlags =
+                    (descr->segmentFlags & MSF_WRITABLE ? MTF_WRITEABLE : 0) |
+                    (descr->segmentFlags & MSF_NOOVERWRITE ? MTF_NO_OVERWRITE : 0) |
+                    (descr->segmentFlags & MSF_BYTES ? MTF_BYTES : 0) |
+                    (descr->segmentFlags & MSF_CODE ? MTF_EXECUTABLE : 0);
+                // TODO: This creates the new space as though it existed in the original executable.
+                // We need to distinguish it somehow so we know which module it came from.
+                PermanentMemSpace* newSpace =
+                    gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, header.thisModuleId);
+                if (newSpace == 0)
                 {
                     errorResult = "Unable to allocate memory";
                     return;
                 }
-                space = lSpace;
-                lSpace->lowerAllocPtr = (PolyWord*)((byte*)lSpace->bottom + descr->segmentSize);
+                if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
+                {
+                    errorResult = "Unable to seek to segment";
+                    return;
+                }
+                if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
+                {
+                    errorResult = "Unable to read segment";
+                    return;
+                }
+                if (newSpace->isMutable && (descr->segmentFlags & MSF_BYTES) != 0)
+                {
+                    ClearVolatile cwbr;
+                    cwbr.ScanAddressesInRegion(newSpace->bottom, (PolyWord*)((byte*)newSpace->bottom + descr->segmentSize));
+                }
+                load.targetAddr = newSpace->bottom;
             }
-            if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
-            {
-                errorResult = "Unable to seek to segment";
-                return;
-            }
-            if (readData(space->bottom, descr->segmentSize, loadFile) != 1)
-            {
-                errorResult = "Unable to read segment";
-                return;
-            }
-            relocate.targetAddresses[descr->segmentIndex] = space->bottom;
-            if (space->isMutable && (descr->segmentFlags & SSF_BYTES) != 0)
-            {
-                ClearVolatile cwbr;
-                cwbr.ScanAddressesInRegion(space->bottom, (PolyWord*)((byte*)space->bottom + descr->segmentSize));
-            }
+            loadData.push_back(load);
         }
-    }
-    // Now deal with relocation.
-    for (unsigned j = 0; j < relocate.nDescrs; j++)
-    {
-        SavedStateSegmentDescr *descr = &relocate.descrs[j];
-        PolyWord *baseAddr = relocate.targetAddresses[descr->segmentIndex];
-        ASSERT(baseAddr != NULL); // We should have created it.
-        // Process explicit relocations.
-        // If we get errors just skip the error and continue rather than leave
-        // everything in an unstable state.
-        if (descr->relocations)
+        // Now deal with relocation.
+        for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
         {
-            if (fseek(loadFile, descr->relocations, SEEK_SET) != 0)
-                errorResult = "Unable to read relocation segment";
-            for (unsigned k = 0; k < descr->relocationCount; k++)
+            PolyWord* baseAddr = i->targetAddr;
+            ASSERT(baseAddr != NULL); // We should have created it.
+            // Process explicit relocations.
+            // If we get errors just skip the error and continue rather than leave
+            // everything in an unstable state.
+            if (i->relocations)
             {
-                RelocationEntry reloc;
-                if (fread(&reloc, sizeof(reloc), 1, loadFile) != 1)
+                if (fseek(loadFile, i->relocations, SEEK_SET) != 0)
                     errorResult = "Unable to read relocation segment";
-                byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
-                byte *targetAddress = (byte*)relocate.targetAddresses[reloc.targetSegment] + reloc.targetAddress;
-                ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                for (unsigned k = 0; k < i->relocationCount; k++)
+                {
+                    ModRelocationEntry reloc;
+                    if (fread(&reloc, sizeof(reloc), 1, loadFile) != 1)
+                        errorResult = "Unable to read relocation segment";
+                    byte* setAddress = (byte*)baseAddr + reloc.relocAddress;
+                    ASSERT(reloc.targetSegment < header.segmentDescrCount);
+                    byte* targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
+                    ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                }
             }
         }
-    }
 
-    // Get the root address.  Push this to the caller's save vec.  If we put the
-    // newly created areas into local memory we could get a GC as soon as we
-    // complete this root request.
+        // Get the root address.  Push this to the caller's save vec.  If we put the
+        // newly created areas into local memory we could get a GC as soon as we
+        // complete this root request.
+        {
+            ASSERT(header.rootSegment < header.segmentDescrCount);
+            PolyWord* baseAddr = loadData[header.rootSegment].targetAddr;
+            rootHandle = callerTaskData->saveVec.push((PolyObject*)((byte*)baseAddr + header.rootOffset));
+        }
+        loadedModId = header.thisModuleId;
+
+        // Now add the entry to the loaded module table
+        loadedModules.push_back(loadMod);
+    }
+    catch (const std::bad_alloc&)
     {
-        PolyWord *baseAddr = relocate.targetAddresses[header.rootSegment];
-        rootHandle = callerTaskData->saveVec.push((PolyObject*)((byte*)baseAddr + header.rootOffset));
+        errorResult = "Insufficient Memory : C++ allocation failed";
     }
 }
 
-static Handle LoadModule(TaskData *taskData, Handle args)
+static Handle LoadModule(TaskData* taskData, Handle args)
 {
-    TempString fileName(args->Word());
+    std_tstring fileName = PolyStringToTString(args->Word());
     ModuleLoader loader(taskData, fileName);
     processes->MakeRootRequest(taskData, &loader);
 
@@ -2046,23 +2219,27 @@ static Handle LoadModule(TaskData *taskData, Handle args)
             raise_fail(taskData, loader.errorResult);
         else
         {
-            AutoFree<char*> buff((char *)malloc(strlen(loader.errorResult) + 2 + _tcslen(loader.fileName) * sizeof(TCHAR) + 1));
+            AutoFree<char*> buff((char*)malloc(strlen(loader.errorResult) + 2 + loader.fileName.size() * sizeof(TCHAR) + 1));
 #if (defined(_WIN32) && defined(UNICODE))
-            sprintf(buff, "%s: %S", loader.errorResult, loader.fileName);
+            sprintf(buff, "%s: %S", loader.errorResult, loader.fileName.c_str());
 #else
-            sprintf(buff, "%s: %s", loader.errorResult, loader.fileName);
+            sprintf(buff, "%s: %s", loader.errorResult, loader.fileName.c_str());
 #endif
             raise_syscall(taskData, buff, loader.errNumber);
         }
     }
 
-    return loader.rootHandle;
+    Handle result = alloc_and_save(taskData, 2);
+    result->WordP()->Set(0, loader.rootHandle->Word());
+    result->WordP()->Set(1, moduleIdAsByteVector(taskData, loader.loadedModId)->Word());
+
+    return result;
 }
 
 // Load a module
 POLYUNSIGNED PolyLoadModule(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 {
-    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
     ASSERT(taskData != 0);
     taskData->PreRTSCall();
     Handle reset = taskData->saveVec.mark();
@@ -2072,6 +2249,7 @@ POLYUNSIGNED PolyLoadModule(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     try {
         result = LoadModule(taskData, pushedArg);
     }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
 
     taskData->saveVec.reset(reset);
@@ -2080,126 +2258,11 @@ POLYUNSIGNED PolyLoadModule(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     else return result->Word().AsUnsigned();
 }
 
-
-PolyObject *InitHeaderFromExport(struct _exportDescription *exports)
-{
-    // Check the structure sizes stored in the export structure match the versions
-    // used in this library.
-    if (exports->structLength != sizeof(exportDescription) ||
-        exports->memTableSize != sizeof(memoryTableEntry) ||
-        exports->rtsVersion < FIRST_supported_version ||
-        exports->rtsVersion > LAST_supported_version)
-    {
-#if (FIRST_supported_version == LAST_supported_version)
-        Exit("The exported object file has version %0.2f but this library supports %0.2f",
-            ((float)exports->rtsVersion) / 100.0,
-            ((float)FIRST_supported_version) / 100.0);
-#else
-        Exit("The exported object file has version %0.2f but this library supports %0.2f-%0.2f",
-            ((float)exports->rtsVersion) / 100.0,
-            ((float)FIRST_supported_version) / 100.0,
-            ((float)LAST_supported_version) / 100.0);
-#endif
-    }
-    // We could also check the RTS version and the architecture.
-    exportTimeStamp = exports->timeStamp; // Needed for load and save.
-
-    memoryTableEntry *memTable = exports->memTable;
-#ifdef POLYML32IN64
-    // We need to copy this into the heap before beginning execution.
-    // This is very like loading a saved state and the code should probably
-    // be merged.
-    LoadRelocate relocate(true);
-    relocate.nDescrs = exports->memTableEntries;
-    relocate.descrs = new SavedStateSegmentDescr[relocate.nDescrs];
-    relocate.targetAddresses = new PolyWord*[exports->memTableEntries];
-    relocate.originalBaseAddr = (PolyWord*)exports->originalBaseAddr;
-
-    PolyObject *root = 0;
-
-    for (unsigned i = 0; i < exports->memTableEntries; i++)
-    {
-        relocate.descrs[i].segmentIndex = memTable[i].mtIndex;
-        relocate.descrs[i].originalAddress = memTable[i].mtOriginalAddr;
-        relocate.descrs[i].segmentSize = memTable[i].mtLength;
-        PermanentMemSpace *newSpace =
-            gMem.AllocateNewPermanentSpace(memTable[i].mtLength, (unsigned)memTable[i].mtFlags, (unsigned)memTable[i].mtIndex);
-        if (newSpace == 0)
-            Exit("Unable to initialise a permanent memory space");
-
-        PolyWord *mem = newSpace->bottom;
-        memcpy(newSpace->writeAble(mem), memTable[i].mtCurrentAddr, memTable[i].mtLength);
-        PolyWord* unused = mem + memTable[i].mtLength / sizeof(PolyWord);
-        gMem.FillUnusedSpace(newSpace->writeAble(unused),
-            newSpace->spaceSize() - memTable[i].mtLength / sizeof(PolyWord));
-
-        if (newSpace == 0)
-            Exit("Unable to initialise a permanent memory space");
-
-        relocate.targetAddresses[i] = mem;
-        relocate.AddTreeRange(&relocate.spaceTree, i, (uintptr_t)relocate.descrs[i].originalAddress,
-            (uintptr_t)((char*)relocate.descrs[i].originalAddress + relocate.descrs[i].segmentSize - 1));
-
-        // Relocate the root function.
-        if (exports->rootFunction >= memTable[i].mtCurrentAddr && exports->rootFunction < (char*)memTable[i].mtCurrentAddr + memTable[i].mtLength)
-        {
-            root = (PolyObject*)((char*)mem + ((char*)exports->rootFunction - (char*)memTable[i].mtCurrentAddr));
-        }
-    }
-
-    // Now relocate the addresses
-    for (unsigned j = 0; j < exports->memTableEntries; j++)
-    {
-        SavedStateSegmentDescr *descr = &relocate.descrs[j];
-        MemSpace *space = gMem.SpaceForIndex(descr->segmentIndex);
-        // Any relative addresses have to be corrected by adding this.
-        relocate.relativeOffset = (PolyWord*)descr->originalAddress - space->bottom;
-        for (PolyWord *p = space->bottom; p < space->top; )
-        {
-#ifdef POLYML32IN64
-            if ((((uintptr_t)p) & 4) == 0)
-            {
-                // Skip any padding.  The length word should be on an odd-word boundary.
-                p++;
-                continue;
-            }
-#endif
-            p++;
-            PolyObject *obj = (PolyObject*)p;
-            POLYUNSIGNED length = obj->Length();
-            relocate.RelocateObject(obj);
-            p += length;
-        }
-    }
-
-    // Set the final permissions.
-    for (unsigned j = 0; j < exports->memTableEntries; j++)
-    {
-        PermanentMemSpace *space = gMem.SpaceForIndex(memTable[j].mtIndex);
-        gMem.CompletePermanentSpaceAllocation(space);
-    }
-
-    return root;
-
-#else
-    for (unsigned i = 0; i < exports->memTableEntries; i++)
-    {
-        // Construct a new space for each of the entries.
-        if (gMem.NewPermanentSpace(
-            (PolyWord*)memTable[i].mtCurrentAddr,
-            memTable[i].mtLength / sizeof(PolyWord), (unsigned)memTable[i].mtFlags,
-            (unsigned)memTable[i].mtIndex) == 0)
-            Exit("Unable to initialise a permanent memory space");
-    }
-    return (PolyObject *)exports->rootFunction;
-#endif
-}
-
 // Return the system directory for modules.  This is configured differently
 // in Unix and in Windows.
 POLYUNSIGNED PolyGetModuleDirectory(POLYUNSIGNED threadId)
 {
-    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
     ASSERT(taskData != 0);
     taskData->PreRTSCall();
     Handle reset = taskData->saveVec.mark();
@@ -2247,17 +2310,207 @@ POLYUNSIGNED PolyGetModuleDirectory(POLYUNSIGNED threadId)
     else return result->Word().AsUnsigned();
 }
 
+
+// Return the list of loaded modules as a list of pairs of name and signature.
+POLYUNSIGNED PolyShowLoadedModules(POLYUNSIGNED threadId)
+{
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+    Handle result = taskData->saveVec.push(ListNull); // Head of list
+
+    try {
+        // Iterate over the table in reverse order so  the resulting list is in the order the modules were loaded.
+        for (std::vector<LoadedModuleData>::reverse_iterator i = loadedModules.rbegin(); i < loadedModules.rend(); i++)
+        {
+            // Convert the module Id to a vector of bytes.  The representation is the same as a string.
+            Handle idHandle = moduleIdAsByteVector(taskData, i->modId);
+            ML_Cons_Cell* next = (ML_Cons_Cell*)alloc(taskData, sizeof(ML_Cons_Cell) / sizeof(PolyWord));
+            next->h = idHandle->Word();
+            next->t = result->Word();
+            // Reset the save vec to keep it bounded
+            taskData->saveVec.reset(reset);
+            result = taskData->saveVec.push(next);
+        }
+    }
+    catch (...) {} // If an ML exception is raised
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
+}
+
+static Handle GetModInfo(TaskData* taskData, Handle hFileName)
+{
+    std_tstring fileName = PolyStringToTString(hFileName->Word());
+    AutoClose loadFile(_tfopen(fileName.c_str(), _T("rb")));
+    if ((FILE*)loadFile == NULL)
+        raise_syscall(taskData, "Cannot open file", ERRORNUMBER); // The string will be set from the error code
+    ModuleHeader header;
+
+    // Read the header and check the signature.
+    if (fread(&header, sizeof(ModuleHeader), 1, loadFile) != 1)
+        raise_fail(taskData, "Unable to load header");
+    if (strncmp(header.headerSignature, MODULESIGNATURE, sizeof(header.headerSignature)) != 0)
+        raise_fail(taskData, "File is not a Poly/ML module");
+    if (header.headerVersion != MODULEVERSION ||
+        header.headerLength != sizeof(ModuleHeader) ||
+        header.segmentDescrLength != sizeof(ModuleSegmentDescr))
+        raise_fail(taskData, "Unsupported version of module file");
+    // Check that the module came from this executable.  We could include the
+    // signature of the executable in the result but then we would also have to
+    // have some way to provide the current value of exportSignature in order to check it.
+    if (ModuleId(header.executableModId) != exportSignature)
+        // Time-stamp does not match executable.
+        raise_fail(taskData, "Module was exported from a different executable or the executable has changed");
+
+    if (header.stringTableSize == 0)
+        raise_fail(taskData, "Missing string table");
+    // String table.  All sizes and offsets are in bytes but the contents are wide chars if
+    // Unicode is being used.
+    AutoFree<char*> stringTab = (char*)malloc(header.stringTableSize);
+    if (stringTab == 0)
+        raise_fail(taskData, "Unable to allocate memory");
+    if (fseek(loadFile, header.stringTable, SEEK_SET) != 0 ||
+        fread(stringTab, 1, header.stringTableSize, loadFile) != header.stringTableSize)
+        raise_fail(taskData, "Unable to read string table");
+    // Check that there is at least one terminator
+    if (stringTab[header.stringTableSize - 1] != 0)
+        raise_fail(taskData, "Malformed string table");
+
+    Handle reset = taskData->saveVec.mark();
+    Handle depListHandle = taskData->saveVec.push(ListNull);
+    if (fseek(loadFile, header.dependencies, SEEK_SET) != 0)
+        raise_fail(taskData, "Unable to access dependency table");
+
+    for (unsigned i = 0; i < header.dependencyCount; i++)
+    {
+        ModDependencyEntry modDepEntry;
+        if (fread(&modDepEntry, sizeof(ModDependencyEntry), 1, loadFile) != 1)
+            raise_fail(taskData, "Unable to load dependency entry");
+        // Convert the module Id to a vector of bytes.  The representation is the same as a string.
+        Handle idHandle = moduleIdAsByteVector(taskData, modDepEntry.depId);
+        if (modDepEntry.depNameEntry >= header.stringTableSize)
+            raise_fail(taskData, "Invalid string table entry");
+        const TCHAR* thisString = (TCHAR*)(stringTab + modDepEntry.depNameEntry);
+        Handle nameHandle = taskData->saveVec.push(C_string_to_Poly(taskData, thisString));
+        Handle pairHandle = alloc_and_save(taskData, 2);
+        pairHandle->WordP()->Set(0, idHandle->Word());
+        pairHandle->WordP()->Set(1, nameHandle->Word());
+        ML_Cons_Cell* next = (ML_Cons_Cell*)alloc(taskData, sizeof(ML_Cons_Cell) / sizeof(PolyWord));
+        next->h = pairHandle->Word();
+        next->t = depListHandle->Word();
+        // Reset the save vec to keep it bounded
+        taskData->saveVec.reset(reset);
+        depListHandle = taskData->saveVec.push(next);
+    }
+
+    Handle modIdHandle = moduleIdAsByteVector(taskData, header.thisModuleId);
+
+    Handle resultHandle = alloc_and_save(taskData, 2);
+    resultHandle->WordP()->Set(0, modIdHandle->Word());
+    resultHandle->WordP()->Set(1, depListHandle->Word());
+
+    return resultHandle;
+}
+
+// Open a module file and read the module information and dependencies
+POLYUNSIGNED PolyGetModuleInfo(POLYUNSIGNED threadId, POLYUNSIGNED arg)
+{
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+    Handle pushedArg = taskData->saveVec.push(arg);
+    Handle result = 0;
+
+    try {
+        result = GetModInfo(taskData, pushedArg);
+    }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
+    catch (...) {} // If an ML exception is raised
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
+}
+
+class ModuleReleaser : public MainThreadRequest
+{
+public:
+    ModuleReleaser(ModuleId mId) : MainThreadRequest(MTP_RELEASEMODULE), moduleId(mId), errorMessage(0) {
+    }
+    virtual void Perform() override;
+
+    ModuleId moduleId;
+    const char* errorMessage;
+
+};
+
+void ModuleReleaser::Perform()
+{
+    try {
+        std::vector<LoadedModuleData>::iterator mod = loadedModules.begin();
+        while (true)
+        {
+            if (mod == loadedModules.end())
+            {
+                errorMessage = "Module is not loaded";
+                return;
+            }
+            if (mod->modId == moduleId)
+                break;
+            else mod++;
+        }
+        loadedModules.erase(mod);
+        if (!gMem.DemoteOldPermanentSpaces(moduleId))
+            errorMessage = "Insufficient Memory";
+    }
+    catch (const std::bad_alloc&)
+    {
+        errorMessage = "Insufficient Memory : C++ allocation failed";
+    }
+}
+
+POLYUNSIGNED PolyReleaseModule(POLYUNSIGNED threadId, POLYUNSIGNED arg)
+{
+    TaskData* taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+
+    try {
+        ModuleId modId = moduleIdFromByteVector(taskData, PolyWord::FromUnsigned(arg));
+        ModuleReleaser modRelease(modId);
+        processes->MakeRootRequest(taskData, &modRelease);
+        if (modRelease.errorMessage != 0)
+            raise_fail(taskData, modRelease.errorMessage);
+    }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
+    catch (...) {} // If an ML exception is raised
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    return TAGGED(0).AsUnsigned();
+}
+
 struct _entrypts savestateEPT[] =
 {
     { "PolySaveState",                  (polyRTSFunction)&PolySaveState },
     { "PolyLoadState",                  (polyRTSFunction)&PolyLoadState },
-    { "PolyShowHierarchy",              (polyRTSFunction)&PolyShowHierarchy },
+    { "PolyGetHierarchy",               (polyRTSFunction)&PolyGetHierarchy },
     { "PolyRenameParent",               (polyRTSFunction)&PolyRenameParent },
     { "PolyShowParent",                 (polyRTSFunction)&PolyShowParent },
+    { "PolyLoadHierarchy",              (polyRTSFunction)&PolyLoadHierarchy },
     { "PolyStoreModule",                (polyRTSFunction)&PolyStoreModule },
     { "PolyLoadModule",                 (polyRTSFunction)&PolyLoadModule },
-    { "PolyLoadHierarchy",              (polyRTSFunction)&PolyLoadHierarchy },
     { "PolyGetModuleDirectory",         (polyRTSFunction)&PolyGetModuleDirectory },
+    { "PolyShowLoadedModules",          (polyRTSFunction)&PolyShowLoadedModules },
+    { "PolyGetModuleInfo",              (polyRTSFunction)&PolyGetModuleInfo },
+    { "PolyReleaseModule",              (polyRTSFunction)&PolyReleaseModule },
 
     { NULL, NULL } // End of list.
 };
