@@ -360,9 +360,9 @@
 <p>On Unix, Processes::ForkProcess runs fork on the calling ML thread after
   pausing the other ML threads and filling unused allocation segments. A
   scheduler barrier prevents new ML work or root requests until the fork
-  completes. The scheduler, allocation and statistics locks are held across
-  fork and unlocked in reverse order in both processes, so garbage collection
-  in the child cannot inherit those locks held by vanished threads. The ForkChild hooks
+  completes. The scheduler, allocation, statistics, GC task farm and signal
+  locks are held across fork and unlocked in reverse order in both processes,
+  so the child cannot inherit those locks held by vanished threads. The ForkChild hooks
   select single-threaded garbage collection and reset its process timing
   and page-fault baselines before ML execution resumes.</p>
 <h3>Memory Management</h3>

@@ -129,6 +129,9 @@ unsigned receivedSignalCount = 0; // Incremented each time we get a signal
 static PLock sigLock;
 
 #if (!defined(_WIN32))
+void LockSignalsForFork() { sigLock.Lock(); }
+void UnlockSignalsAfterFork() { sigLock.Unlock(); }
+
 static PSemaphore *waitSema;
 static int lastSignals[NSIG];
 static bool terminate = false;

@@ -126,6 +126,7 @@
 #include "statistics.h"
 #include "rtsentry.h"
 #include "gc_progress.h"
+#include "gctaskfarm.h"
 
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyThreadKillSelf(POLYUNSIGNED threadId);
@@ -983,12 +984,17 @@ int Processes::ForkProcess(TaskData *taskData)
     // The calling pthread must own these locks so both fork branches can unlock.
     gMem.allocLock.Lock();
     globalStats.accessLock.Lock();
+    // Idle GC workers can still wake on outstanding semaphore signals.
+    gpTaskFarm->workLock.Lock();
+    LockSignalsForFork();
     int pid = ::fork();
     int forkError = errno;
+    UnlockSignalsAfterFork();
+    gpTaskFarm->workLock.Unlock();
     globalStats.accessLock.Unlock();
     gMem.allocLock.Unlock();
     forkInProgress = false;
-    mlThreadWait.Signal();
+    if (pid != 0) mlThreadWait.Signal();
     schedLock.Unlock();
 
     if (pid == 0) ForkChildModules();
