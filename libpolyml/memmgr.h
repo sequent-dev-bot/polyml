@@ -445,6 +445,7 @@ public:
     void RemoveProfilingBitmaps();
 
 private:
+    friend class Processes;
     bool AddLocalSpace(LocalMemSpace *space);
     bool AddCodeSpace(CodeSpace *space);
 

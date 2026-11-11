@@ -126,6 +126,7 @@
 #include "statistics.h"
 #include "rtsentry.h"
 #include "gc_progress.h"
+#include "gctaskfarm.h"
 
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyThreadKillSelf(POLYUNSIGNED threadId);
@@ -188,7 +189,7 @@ public:
     virtual void Init(void);
     virtual void Stop(void);
     virtual void GarbageCollect(ScanAddress *process);
-    virtual void ForkChild(void) { singleThreaded = true;  } // After a Unix fork this is single threaded
+    virtual void ForkChild(void) { singleThreaded = true; threadRequest = 0; }
 public:
     void BroadcastInterrupt(void);
     void BeginRootThread(PolyObject *rootFunction);
@@ -203,6 +204,7 @@ public:
     virtual TaskData *GetTaskDataForThread(void);
     // Create a new task data object for the current thread.
     virtual TaskData *CreateNewTaskData();
+    void ThreadExitedInForeign(TaskData *taskData);
     // Create a new thread.  The "args" argument is only used for threads
     // created in the RTS by the signal handler.
     Handle ForkThread(TaskData *taskData, Handle threadFunction, PolyWord flags, PolyWord stacksize);
@@ -221,6 +223,10 @@ public:
     // Requests from the threads for actions that need to be performed by
     // the root thread. Make the request and wait until it has completed.
     virtual void MakeRootRequest(TaskData *taskData, MainThreadRequest *request);
+
+#if (!defined(_WIN32))
+    virtual int ForkProcess(TaskData *taskData);
+#endif
 
     // Deal with any interrupt or kill requests.
     virtual bool ProcessAsynchRequests(TaskData *taskData);
@@ -304,6 +310,9 @@ public:
     // is only reset once the request has been satisfied.
     MainThreadRequest *threadRequest;
 
+    bool forkInProgress;
+    PCondVar forkWait;
+
     PCondVar mlThreadWait;  // All the threads block on here until the request has completed.
 
     int exitResult;
@@ -326,7 +335,7 @@ ProcessExternal *processes = &processesModule;
 
 Processes::Processes(): singleThreaded(false),
     schedLock("Scheduler"), interrupt_exn(0),
-    threadRequest(0), exitResult(0), exitRequest(false), sigTask(0)
+    threadRequest(0), forkInProgress(false), exitResult(0), exitRequest(false), sigTask(0)
 {
 #ifdef HAVE_WINDOWS_H
     hStopEvent = NULL;
@@ -771,7 +780,7 @@ void TaskData::FillUnusedSpace(void)
 
 TaskData::TaskData(): allocPointer(0), allocLimit(0), allocSize(MIN_HEAP_SIZE), allocCount(0),
         stack(0), threadObject(0), signalStack(0),
-        requests(kRequestNone), blockMutex(0), inMLHeap(false),
+        requests(kRequestNone), blockMutex(0), inMLHeap(false), foreignThread(false),
         runningProfileTimer(false)
 {
 #ifdef HAVE_WINDOWS_H
@@ -880,7 +889,7 @@ void Processes::ThreadUseMLMemoryWithSchedLock(TaskData *taskData)
     TaskData *ptaskData = taskData;
     // If there is a request outstanding we have to wait for it to
     // complete.  We notify the root thread and wait for it.
-    while (threadRequest != 0)
+    while (threadRequest != 0 || forkInProgress)
     {
         initialThreadWait.Signal();
         // Wait for the GC to happen
@@ -905,6 +914,8 @@ void Processes::ThreadReleaseMLMemoryWithSchedLock(TaskData *taskData)
     //
     if (threadRequest != 0)
         initialThreadWait.Signal();
+    if (forkInProgress)
+        forkWait.Signal();
 }
 
 
@@ -915,7 +926,9 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
     {
         mainThreadPhase = request->mtp;
         ThreadReleaseMLMemoryWithSchedLock(taskData); // Primarily to call FillUnusedSpace
+        gMem.ProtectImmutable(false);
         request->Perform();
+        gMem.ProtectImmutable(true);
         ThreadUseMLMemoryWithSchedLock(taskData);
         mainThreadPhase = MTP_USER_CODE;
     }
@@ -924,7 +937,7 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
         PLocker locker(&schedLock);
 
         // Wait for any other requests. 
-        while (threadRequest != 0)
+        while (threadRequest != 0 || forkInProgress)
         {
             // Deal with any pending requests.
             ThreadReleaseMLMemoryWithSchedLock(taskData);
@@ -941,6 +954,63 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
         }
     }
 }
+
+#if (!defined(_WIN32))
+int Processes::ForkProcess(TaskData *taskData)
+{
+    schedLock.Lock();
+    while (threadRequest != 0 || forkInProgress)
+    {
+        ThreadReleaseMLMemoryWithSchedLock(taskData);
+        ThreadUseMLMemoryWithSchedLock(taskData);
+    }
+
+    forkInProgress = true;
+    ThreadReleaseMLMemoryWithSchedLock(taskData);
+    while (true)
+    {
+        bool allStopped = true;
+        for (std::vector<TaskData*>::iterator i = taskArray.begin(); i != taskArray.end(); i++)
+        {
+            TaskData *p = *i;
+            if (p && p->inMLHeap)
+            {
+                allStopped = false;
+                p->InterruptCode();
+            }
+        }
+        if (allStopped) break;
+        forkWait.Wait(&schedLock);
+    }
+
+    // I/O threads can update statistics even after releasing the ML heap.
+    // The calling pthread must own these locks so both fork branches can unlock.
+    // A first foreign callback can allocate its stack before entering the heap.
+    gMem.stackSpaceLock.Lock();
+    gMem.allocLock.Lock();
+    gMem.spaceTreeLock.Lock();
+    globalStats.accessLock.Lock();
+    // Idle GC workers can still wake on outstanding semaphore signals.
+    gpTaskFarm->workLock.Lock();
+    LockSignalsForFork();
+    int pid = ::fork();
+    int forkError = errno;
+    UnlockSignalsAfterFork();
+    gpTaskFarm->workLock.Unlock();
+    globalStats.accessLock.Unlock();
+    gMem.spaceTreeLock.Unlock();
+    gMem.allocLock.Unlock();
+    gMem.stackSpaceLock.Unlock();
+    forkInProgress = false;
+    if (pid != 0) mlThreadWait.Signal();
+    schedLock.Unlock();
+
+    if (pid == 0) ForkChildModules();
+    ThreadUseMLMemory(taskData);
+    errno = forkError;
+    return pid;
+}
+#endif
 
 // Find space for an object.  Returns a pointer to the start.  "words" must include
 // the length word and the result points at where the length word will go.
@@ -1166,11 +1236,24 @@ TaskData *Processes::GetTaskDataForThread(void)
 TaskData *Processes::CreateNewTaskData()
 {
     TaskData *taskData = machineDependent->CreateTaskData();
+    taskData->foreignThread = true;
 #if defined(HAVE_WINDOWS_H)
     HANDLE thisProcess = GetCurrentProcess();
     DuplicateHandle(thisProcess, GetCurrentThread(), thisProcess, 
         &(taskData->threadHandle), THREAD_ALL_ACCESS, FALSE, 0);
 #endif
+    // Publish only a fully initialized stack, so GC and fork never scan a
+    // partially initialized callback task.
+    taskData->stack = gMem.NewStackSpace(machineDependent->InitialStackSize());
+    if (taskData->stack == 0)
+    {
+        delete(taskData);
+        throw MemoryException();
+    }
+    Handle mark = taskData->saveVec.mark();
+    taskData->InitStackFrame(taskData, taskData->saveVec.push(TAGGED(0)));
+    taskData->saveVec.reset(mark);
+
     unsigned thrdIndex;
 
     {
@@ -1193,22 +1276,8 @@ TaskData *Processes::CreateNewTaskData()
         {
             taskArray[thrdIndex] = taskData;
         }
+        ThreadUseMLMemoryWithSchedLock(taskData);
     }
-
-    taskData->stack = gMem.NewStackSpace(machineDependent->InitialStackSize());
-    if (taskData->stack == 0)
-    {
-        PLocker lock(&schedLock);
-        taskArray[thrdIndex] = 0;
-        delete(taskData);
-        throw MemoryException();
-    }
-
-    // TODO:  Check that there isn't a problem if we try to allocate
-    // memory here and result in a GC.
-    taskData->InitStackFrame(taskData, 0);
-
-    ThreadUseMLMemory(taskData);
 
     // Make a thread reference to point to this taskData object.
     Handle threadRef = MakeVolatileWord(taskData, taskData);
@@ -1230,6 +1299,8 @@ TaskData *Processes::CreateNewTaskData()
 #endif
     globalStats.incCount(PSC_THREADS);
 
+    taskData->saveVec.init();
+    taskData->PostRTSCall();
     return taskData;
 }
 
@@ -1389,7 +1460,8 @@ void Processes::BeginRootThread(PolyObject *rootFunction)
                 {
                     // Wait for it to actually stop then delete the task data.
 #if (!defined(_WIN32))
-                    pthread_join(p->threadId, NULL);
+                    // Foreign code owns the join for its threads.
+                    if (! p->foreignThread) pthread_join(p->threadId, NULL);
 #else
                     WaitForSingleObject(p->threadHandle, INFINITE);
 #endif
@@ -1927,14 +1999,23 @@ void Processes::SignalArrived(void)
 }
 
 #if (!defined(_WIN32))
+void Processes::ThreadExitedInForeign(TaskData *taskData)
+{
+    PLocker lock(&schedLock);
+    if (taskData->inMLHeap)
+    {
+        taskData->PreRTSCall();
+        ThreadReleaseMLMemoryWithSchedLock(taskData);
+    }
+    taskData->threadExited = true;
+    initialThreadWait.Signal();
+}
+
 // This is called when the thread exits in foreign code and
 // ThreadExit has not been called.
 static void threaddata_destructor(void *p)
 {
-    TaskData *pt = (TaskData *)p;
-    pt->threadExited = true;
-    // This doesn't actually wake the main thread and relies on the
-    // regular check to release the task data.
+    processesModule.ThreadExitedInForeign((TaskData *)p);
 }
 #endif
 

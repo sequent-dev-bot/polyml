@@ -129,6 +129,9 @@ unsigned receivedSignalCount = 0; // Incremented each time we get a signal
 static PLock sigLock;
 
 #if (!defined(_WIN32))
+void LockSignalsForFork() { sigLock.Lock(); }
+void UnlockSignalsAfterFork() { sigLock.Unlock(); }
+
 static PSemaphore *waitSema;
 static int lastSignals[NSIG];
 static bool terminate = false;
@@ -226,6 +229,9 @@ void SignalRequest::Perform()
 
 static Handle waitForSignal(TaskData *taskData)
 {
+    // Allocation can wait for a GC or fork, so it must not hold sigLock.
+    // The pair can be promoted while waiting, then filled after a signal.
+    Handle pair = alloc_and_save(taskData, 2, F_MUTABLE_BIT);
     while (true)
     {
         processes->ProcessAsynchRequests(taskData); // Check for kill.
@@ -240,9 +246,6 @@ static Handle waitForSignal(TaskData *taskData)
                 {
                     // Create a pair of the handler and signal and pass
                     // them back to be run.
-                    Handle pair = alloc_and_save(taskData, 2);
-                    // Have to call findHandler again here because that
-                    // allocation could have garbage collected.
                     DEREFHANDLE(pair)->Set(0, findHandler(sig));
                     DEREFHANDLE(pair)->Set(1, TAGGED(sig));
                     sigLock.Unlock();
@@ -277,22 +280,20 @@ POLYUNSIGNED PolySetSignalHandler(POLYUNSIGNED threadId, POLYUNSIGNED signalNo, 
 
     try {
         {
-            int sign;
+            int sign = get_C_int(taskData, PolyWord::FromUnsigned(signalNo));
             int action;
+            // Conversion and exception construction can allocate ML memory.
+            // Finish them before taking sigLock.
+            if (sign <= 0 || sign >= NSIG)
+                raise_syscall(taskData, "Invalid signal value", INVALIDSIGNAL);
+            /* Decode the action if it is Ignore or Default. */
+            if (pushedAction->Word().IsTagged())
+                action = (int)pushedAction->Word().UnTagged();
+            else action = HANDLE_SIG; /* Set the handler. */
             {
                 // Lock while we look at the signal vector but release
                 // it before making a root request.
                 PLocker locker(&sigLock);
-                // We have to pass this to the main thread to 
-                // set up the signal handler.
-                sign = get_C_int(taskData, PolyWord::FromUnsigned(signalNo));
-                /* Decode the action if it is Ignore or Default. */
-                if (pushedAction->Word().IsTagged())
-                    action = (int)pushedAction->Word().UnTagged();
-                else action = HANDLE_SIG; /* Set the handler. */
-                if (sign <= 0 || sign >= NSIG)
-                    raise_syscall(taskData, "Invalid signal value", INVALIDSIGNAL);
-
                 /* Get the old action before updating the vector. */
                 oldaction = SAVE(findHandler(sign));
                 // Now update it.

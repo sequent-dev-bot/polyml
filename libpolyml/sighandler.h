@@ -43,6 +43,10 @@ extern bool setSignalHandler(int sig, signal_handler_type func);
 // Set up per-thread signal data: basically signal stack.
 extern void initThreadSignals(TaskData *taskData);
 
+// The fork caller holds these only after all ML heap users have stopped.
+extern void LockSignalsForFork();
+extern void UnlockSignalsAfterFork();
+
 #endif /* ! _WIN32 */
 
 extern unsigned receivedSignalCount; // Incremented each time we get a signal

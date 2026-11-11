@@ -428,6 +428,7 @@ void GarbageCollectModule::ForkChild(void)
 {
     gpTaskFarm->SetSingleThreaded();
     initialiseMarkerTables();
+    gHeapSizeParameters.ForkChild();
 }
 
 // Declare this.  It will be automatically added to the table.

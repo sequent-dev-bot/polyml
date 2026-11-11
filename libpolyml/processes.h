@@ -173,6 +173,7 @@ private:
     // While it is true the thread can manipulate ML memory so no other
     // thread can garbage collect.
     bool inMLHeap;
+    bool foreignThread;
 
     // In Linux, at least, we need to run a separate timer in each thread
     bool runningProfileTimer;
@@ -318,6 +319,11 @@ public:
     // Requests from the threads for actions that need to be performed by
     // the root thread.
     virtual void MakeRootRequest(TaskData *taskData, MainThreadRequest *request) = 0;
+
+#if (!defined(_WIN32))
+    // Fork on the calling pthread with the ML heap and runtime locks quiescent.
+    virtual int ForkProcess(TaskData *taskData) = 0;
+#endif
 
     // Deal with any interrupt or kill requests.
     virtual bool ProcessAsynchRequests(TaskData *taskData) = 0;

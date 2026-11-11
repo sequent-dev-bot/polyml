@@ -51,7 +51,11 @@ public:
     bool Initialise(unsigned threadCount, unsigned queueSize);
     // Set single threaded mode. This is only used in a child process after
     // Posix fork in case there is a GC before the exec.
-    void SetSingleThreaded() { threadCount = 0; queueSize = 0; }
+    void SetSingleThreaded()
+    {
+        threadCount = activeThreadCount = 0;
+        queueSize = queueIn = queuedItems = 0;
+    }
 
     bool AddWork(gctask task, void *arg1, void *arg2);
     void AddWorkOrRunNow(gctask task, void *arg1, void *arg2);
@@ -64,6 +68,7 @@ public:
     unsigned ThreadCount(void) const { return threadCount; }
 
 private:
+    friend class Processes;
     // The semaphore is zero if there is no work or some value up to
     // the number of threads if there is work.
     PSemaphore waitForWork;

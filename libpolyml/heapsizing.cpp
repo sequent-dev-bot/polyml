@@ -694,6 +694,15 @@ void HeapSizeParameters::RecordAtStartOfMajorGC()
     allocationFailedBeforeLastMajorGC = !lastAllocationSucceeded;
 }
 
+void HeapSizeParameters::ForkChild()
+{
+    GetLastStats(startUsageU, startUsageS, startRTime, startPF);
+    lastUsageU = startUsageU;
+    lastUsageS = startUsageS;
+    lastRTime = startRTime;
+    resetMajorTimingData();
+}
+
 // This function is called at the beginning and end of garbage
 // collection to record the time used.
 // This also reports the GC time if GC debugging is enabled.
