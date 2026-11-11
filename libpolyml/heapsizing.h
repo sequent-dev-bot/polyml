@@ -74,6 +74,9 @@ public:
     void Init(void);
     void Final(void);
 
+    // Per-process page-fault counters start again after a Unix fork.
+    void ForkChild(void);
+
 private:
     // Estimate the GC cost for a given heap size.  The result is the ratio of
     // GC time to application time.

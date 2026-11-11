@@ -412,11 +412,8 @@ static Handle OS_spec_dispatch_c(TaskData *taskData, Handle args, Handle code)
 
     case 5: /* fork. */
         {
-            pid_t pid = fork();
+            pid_t pid = processes->ForkProcess(taskData);
             if (pid < 0) raise_syscall(taskData, "fork failed", errno);
-            // Have to clean up the RTS in the child.  It's single threaded among other things.
-            if (pid == 0)
-                ForkChildModules();
             return Make_fixed_precision(taskData, pid);
         }
 

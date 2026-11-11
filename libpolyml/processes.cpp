@@ -188,7 +188,7 @@ public:
     virtual void Init(void);
     virtual void Stop(void);
     virtual void GarbageCollect(ScanAddress *process);
-    virtual void ForkChild(void) { singleThreaded = true;  } // After a Unix fork this is single threaded
+    virtual void ForkChild(void) { singleThreaded = true; threadRequest = 0; }
 public:
     void BroadcastInterrupt(void);
     void BeginRootThread(PolyObject *rootFunction);
@@ -221,6 +221,10 @@ public:
     // Requests from the threads for actions that need to be performed by
     // the root thread. Make the request and wait until it has completed.
     virtual void MakeRootRequest(TaskData *taskData, MainThreadRequest *request);
+
+#if (!defined(_WIN32))
+    virtual int ForkProcess(TaskData *taskData);
+#endif
 
     // Deal with any interrupt or kill requests.
     virtual bool ProcessAsynchRequests(TaskData *taskData);
@@ -304,6 +308,9 @@ public:
     // is only reset once the request has been satisfied.
     MainThreadRequest *threadRequest;
 
+    bool forkInProgress;
+    PCondVar forkWait;
+
     PCondVar mlThreadWait;  // All the threads block on here until the request has completed.
 
     int exitResult;
@@ -326,7 +333,7 @@ ProcessExternal *processes = &processesModule;
 
 Processes::Processes(): singleThreaded(false),
     schedLock("Scheduler"), interrupt_exn(0),
-    threadRequest(0), exitResult(0), exitRequest(false), sigTask(0)
+    threadRequest(0), forkInProgress(false), exitResult(0), exitRequest(false), sigTask(0)
 {
 #ifdef HAVE_WINDOWS_H
     hStopEvent = NULL;
@@ -880,7 +887,7 @@ void Processes::ThreadUseMLMemoryWithSchedLock(TaskData *taskData)
     TaskData *ptaskData = taskData;
     // If there is a request outstanding we have to wait for it to
     // complete.  We notify the root thread and wait for it.
-    while (threadRequest != 0)
+    while (threadRequest != 0 || forkInProgress)
     {
         initialThreadWait.Signal();
         // Wait for the GC to happen
@@ -905,6 +912,8 @@ void Processes::ThreadReleaseMLMemoryWithSchedLock(TaskData *taskData)
     //
     if (threadRequest != 0)
         initialThreadWait.Signal();
+    if (forkInProgress)
+        forkWait.Signal();
 }
 
 
@@ -924,7 +933,7 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
         PLocker locker(&schedLock);
 
         // Wait for any other requests. 
-        while (threadRequest != 0)
+        while (threadRequest != 0 || forkInProgress)
         {
             // Deal with any pending requests.
             ThreadReleaseMLMemoryWithSchedLock(taskData);
@@ -941,6 +950,53 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
         }
     }
 }
+
+#if (!defined(_WIN32))
+int Processes::ForkProcess(TaskData *taskData)
+{
+    schedLock.Lock();
+    while (threadRequest != 0 || forkInProgress)
+    {
+        ThreadReleaseMLMemoryWithSchedLock(taskData);
+        ThreadUseMLMemoryWithSchedLock(taskData);
+    }
+
+    forkInProgress = true;
+    ThreadReleaseMLMemoryWithSchedLock(taskData);
+    while (true)
+    {
+        bool allStopped = true;
+        for (std::vector<TaskData*>::iterator i = taskArray.begin(); i != taskArray.end(); i++)
+        {
+            TaskData *p = *i;
+            if (p && p->inMLHeap)
+            {
+                allStopped = false;
+                p->InterruptCode();
+            }
+        }
+        if (allStopped) break;
+        forkWait.Wait(&schedLock);
+    }
+
+    // I/O threads can update statistics even after releasing the ML heap.
+    // The calling pthread must own these locks so both fork branches can unlock.
+    gMem.allocLock.Lock();
+    globalStats.accessLock.Lock();
+    int pid = ::fork();
+    int forkError = errno;
+    globalStats.accessLock.Unlock();
+    gMem.allocLock.Unlock();
+    forkInProgress = false;
+    mlThreadWait.Signal();
+    schedLock.Unlock();
+
+    if (pid == 0) ForkChildModules();
+    ThreadUseMLMemory(taskData);
+    errno = forkError;
+    return pid;
+}
+#endif
 
 // Find space for an object.  Returns a pointer to the start.  "words" must include
 // the length word and the result points at where the length word will go.

@@ -319,6 +319,11 @@ public:
     // the root thread.
     virtual void MakeRootRequest(TaskData *taskData, MainThreadRequest *request) = 0;
 
+#if (!defined(_WIN32))
+    // Fork on the calling pthread with the ML heap and runtime locks quiescent.
+    virtual int ForkProcess(TaskData *taskData) = 0;
+#endif
+
     // Deal with any interrupt or kill requests.
     virtual bool ProcessAsynchRequests(TaskData *taskData) = 0;
     // Process an interrupt request synchronously.

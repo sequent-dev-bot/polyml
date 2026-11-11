@@ -112,6 +112,7 @@ public:
     bool exportStats;
 
 private:
+    friend class Processes;
     PLock accessLock;
 #ifdef _WIN32
     // File mapping handle
