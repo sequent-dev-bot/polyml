@@ -204,6 +204,7 @@ public:
     virtual TaskData *GetTaskDataForThread(void);
     // Create a new task data object for the current thread.
     virtual TaskData *CreateNewTaskData();
+    void ThreadExitedInForeign(TaskData *taskData);
     // Create a new thread.  The "args" argument is only used for threads
     // created in the RTS by the signal handler.
     Handle ForkThread(TaskData *taskData, Handle threadFunction, PolyWord flags, PolyWord stacksize);
@@ -779,7 +780,7 @@ void TaskData::FillUnusedSpace(void)
 
 TaskData::TaskData(): allocPointer(0), allocLimit(0), allocSize(MIN_HEAP_SIZE), allocCount(0),
         stack(0), threadObject(0), signalStack(0),
-        requests(kRequestNone), blockMutex(0), inMLHeap(false),
+        requests(kRequestNone), blockMutex(0), inMLHeap(false), foreignThread(false),
         runningProfileTimer(false)
 {
 #ifdef HAVE_WINDOWS_H
@@ -984,7 +985,10 @@ int Processes::ForkProcess(TaskData *taskData)
 
     // I/O threads can update statistics even after releasing the ML heap.
     // The calling pthread must own these locks so both fork branches can unlock.
+    // A first foreign callback can allocate its stack before entering the heap.
+    gMem.stackSpaceLock.Lock();
     gMem.allocLock.Lock();
+    gMem.spaceTreeLock.Lock();
     globalStats.accessLock.Lock();
     // Idle GC workers can still wake on outstanding semaphore signals.
     gpTaskFarm->workLock.Lock();
@@ -994,7 +998,9 @@ int Processes::ForkProcess(TaskData *taskData)
     UnlockSignalsAfterFork();
     gpTaskFarm->workLock.Unlock();
     globalStats.accessLock.Unlock();
+    gMem.spaceTreeLock.Unlock();
     gMem.allocLock.Unlock();
+    gMem.stackSpaceLock.Unlock();
     forkInProgress = false;
     if (pid != 0) mlThreadWait.Signal();
     schedLock.Unlock();
@@ -1230,11 +1236,24 @@ TaskData *Processes::GetTaskDataForThread(void)
 TaskData *Processes::CreateNewTaskData()
 {
     TaskData *taskData = machineDependent->CreateTaskData();
+    taskData->foreignThread = true;
 #if defined(HAVE_WINDOWS_H)
     HANDLE thisProcess = GetCurrentProcess();
     DuplicateHandle(thisProcess, GetCurrentThread(), thisProcess, 
         &(taskData->threadHandle), THREAD_ALL_ACCESS, FALSE, 0);
 #endif
+    // Publish only a fully initialized stack, so GC and fork never scan a
+    // partially initialized callback task.
+    taskData->stack = gMem.NewStackSpace(machineDependent->InitialStackSize());
+    if (taskData->stack == 0)
+    {
+        delete(taskData);
+        throw MemoryException();
+    }
+    Handle mark = taskData->saveVec.mark();
+    taskData->InitStackFrame(taskData, taskData->saveVec.push(TAGGED(0)));
+    taskData->saveVec.reset(mark);
+
     unsigned thrdIndex;
 
     {
@@ -1257,22 +1276,8 @@ TaskData *Processes::CreateNewTaskData()
         {
             taskArray[thrdIndex] = taskData;
         }
+        ThreadUseMLMemoryWithSchedLock(taskData);
     }
-
-    taskData->stack = gMem.NewStackSpace(machineDependent->InitialStackSize());
-    if (taskData->stack == 0)
-    {
-        PLocker lock(&schedLock);
-        taskArray[thrdIndex] = 0;
-        delete(taskData);
-        throw MemoryException();
-    }
-
-    // TODO:  Check that there isn't a problem if we try to allocate
-    // memory here and result in a GC.
-    taskData->InitStackFrame(taskData, 0);
-
-    ThreadUseMLMemory(taskData);
 
     // Make a thread reference to point to this taskData object.
     Handle threadRef = MakeVolatileWord(taskData, taskData);
@@ -1294,6 +1299,8 @@ TaskData *Processes::CreateNewTaskData()
 #endif
     globalStats.incCount(PSC_THREADS);
 
+    taskData->saveVec.init();
+    taskData->PostRTSCall();
     return taskData;
 }
 
@@ -1453,7 +1460,8 @@ void Processes::BeginRootThread(PolyObject *rootFunction)
                 {
                     // Wait for it to actually stop then delete the task data.
 #if (!defined(_WIN32))
-                    pthread_join(p->threadId, NULL);
+                    // Foreign code owns the join for its threads.
+                    if (! p->foreignThread) pthread_join(p->threadId, NULL);
 #else
                     WaitForSingleObject(p->threadHandle, INFINITE);
 #endif
@@ -1991,14 +1999,23 @@ void Processes::SignalArrived(void)
 }
 
 #if (!defined(_WIN32))
+void Processes::ThreadExitedInForeign(TaskData *taskData)
+{
+    PLocker lock(&schedLock);
+    if (taskData->inMLHeap)
+    {
+        taskData->PreRTSCall();
+        ThreadReleaseMLMemoryWithSchedLock(taskData);
+    }
+    taskData->threadExited = true;
+    initialThreadWait.Signal();
+}
+
 // This is called when the thread exits in foreign code and
 // ThreadExit has not been called.
 static void threaddata_destructor(void *p)
 {
-    TaskData *pt = (TaskData *)p;
-    pt->threadExited = true;
-    // This doesn't actually wake the main thread and relies on the
-    // regular check to release the task data.
+    processesModule.ThreadExitedInForeign((TaskData *)p);
 }
 #endif
 

@@ -173,6 +173,7 @@ private:
     // While it is true the thread can manipulate ML memory so no other
     // thread can garbage collect.
     bool inMLHeap;
+    bool foreignThread;
 
     // In Linux, at least, we need to run a separate timer in each thread
     bool runningProfileTimer;
