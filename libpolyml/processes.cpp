@@ -925,7 +925,9 @@ void Processes::MakeRootRequest(TaskData *taskData, MainThreadRequest *request)
     {
         mainThreadPhase = request->mtp;
         ThreadReleaseMLMemoryWithSchedLock(taskData); // Primarily to call FillUnusedSpace
+        gMem.ProtectImmutable(false);
         request->Perform();
+        gMem.ProtectImmutable(true);
         ThreadUseMLMemoryWithSchedLock(taskData);
         mainThreadPhase = MTP_USER_CODE;
     }

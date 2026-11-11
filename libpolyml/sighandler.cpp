@@ -230,7 +230,8 @@ void SignalRequest::Perform()
 static Handle waitForSignal(TaskData *taskData)
 {
     // Allocation can wait for a GC or fork, so it must not hold sigLock.
-    Handle pair = alloc_and_save(taskData, 2);
+    // The pair can be promoted while waiting, then filled after a signal.
+    Handle pair = alloc_and_save(taskData, 2, F_MUTABLE_BIT);
     while (true)
     {
         processes->ProcessAsynchRequests(taskData); // Check for kill.

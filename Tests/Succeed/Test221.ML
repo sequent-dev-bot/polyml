@@ -1,5 +1,6 @@
 (* A forked child must be able to collect and set a signal handler before
-   exec, even while allocation, GC workers and signal detection are active. *)
+   exec, even while allocation, GC workers and signal detection are active.
+   Also run with --debug checkmem to detect writes to a promoted signal result. *)
 case #lookupStruct PolyML.globalNameSpace "Unix" of
     SOME _ => ()
 |   NONE => raise NotApplicable;
