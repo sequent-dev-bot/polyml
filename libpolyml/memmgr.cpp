@@ -788,28 +788,21 @@ CodeSpace *MemMgr::NewCodeSpace(uintptr_t size)
         try {
             allocSpace = new CodeSpace(mem, (PolyWord*)shadow, actualSize / sizeof(PolyWord), &osCodeAlloc);
             allocSpace->shadowSpace = (PolyWord*)shadow;
-            if (!allocSpace->headerMap.Create(allocSpace->spaceSize()))
+            if (!allocSpace->headerMap.Create(allocSpace->spaceSize()) || !AddCodeSpace(allocSpace))
             {
-                delete allocSpace;
-                allocSpace = 0;
+                delete allocSpace; // Also releases the code mappings.
+                return 0;
             }
-            else if (!AddCodeSpace(allocSpace))
-            {
-                delete allocSpace;
-                allocSpace = 0;
-            }
-            else if (debugOptions & DEBUG_MEMMGR)
+            if (debugOptions & DEBUG_MEMMGR)
                 Log("MMGR: New code space %p allocated at %p size %lu\n", allocSpace, allocSpace->bottom, allocSpace->spaceSize());
             // Put in a byte cell to mark the area as unallocated.
             FillUnusedSpace(allocSpace->writeAble(allocSpace->firstFree), allocSpace->top- allocSpace->firstFree);
         }
         catch (std::bad_alloc&)
         {
-        }
-        if (allocSpace == 0)
-        {
+            // The CodeSpace constructor did not take ownership of the mappings.
             osCodeAlloc.FreeCodeArea(mem, shadow, actualSize);
-            mem = 0;
+            return 0;
         }
     }
     return allocSpace;
@@ -881,7 +874,7 @@ PolyObject* MemMgr::AllocCodeSpace(POLYUNSIGNED requiredSize)
                     if (pt == space->firstFree)
                         space->firstFree = next;
                     if (pt + length + 1 == space->top)
-                        space->largestFree = std::max(actualLargest, spare == 0 ? 0 : spare - 1);
+                        space->largestFree = spare > actualLargest ? spare - 1 : actualLargest;
                     space->isMutable = true; // Ensure the area is scanned on GC.
                     space->headerMap.SetBit(pt-space->bottom);
                     // Set the code bit before releasing the lock so another
