@@ -35,6 +35,7 @@
 #include <stdio.h>
 
 #include <new>
+#include <algorithm>
 
 #include "globals.h"
 #include "memmgr.h"
@@ -787,31 +788,30 @@ CodeSpace *MemMgr::NewCodeSpace(uintptr_t size)
         try {
             allocSpace = new CodeSpace(mem, (PolyWord*)shadow, actualSize / sizeof(PolyWord), &osCodeAlloc);
             allocSpace->shadowSpace = (PolyWord*)shadow;
-            if (!allocSpace->headerMap.Create(allocSpace->spaceSize()))
+            if (!allocSpace->headerMap.Create(allocSpace->spaceSize()) || !AddCodeSpace(allocSpace))
             {
-                delete allocSpace;
-                allocSpace = 0;
+                delete allocSpace; // Also releases the code mappings.
+                return 0;
             }
-            else if (!AddCodeSpace(allocSpace))
-            {
-                delete allocSpace;
-                allocSpace = 0;
-            }
-            else if (debugOptions & DEBUG_MEMMGR)
+            if (debugOptions & DEBUG_MEMMGR)
                 Log("MMGR: New code space %p allocated at %p size %lu\n", allocSpace, allocSpace->bottom, allocSpace->spaceSize());
             // Put in a byte cell to mark the area as unallocated.
             FillUnusedSpace(allocSpace->writeAble(allocSpace->firstFree), allocSpace->top- allocSpace->firstFree);
         }
         catch (std::bad_alloc&)
         {
-        }
-        if (allocSpace == 0)
-        {
+            // The CodeSpace constructor did not take ownership of the mappings.
             osCodeAlloc.FreeCodeArea(mem, shadow, actualSize);
-            mem = 0;
+            return 0;
         }
     }
     return allocSpace;
+}
+
+// largestFree is an upper bound: GC may include the free object's header.
+static bool SmallerCodeSpace(const CodeSpace *left, const CodeSpace *right)
+{
+    return left->largestFree < right->largestFree;
 }
 
 // Allocate memory for a piece of code.  This needs to be both mutable and executable,
@@ -822,70 +822,14 @@ CodeSpace *MemMgr::NewCodeSpace(uintptr_t size)
 PolyObject* MemMgr::AllocCodeSpace(POLYUNSIGNED requiredSize)
 {
     PLocker locker(&codeSpaceLock);
-    // Search the code spaces until we find a free area big enough.
-    size_t i = 0;
     while (true)
     {
-        if (i != cSpaces.size())
+        if (codeSpaceHeap.empty() || codeSpaceHeap.front()->largestFree == 0 ||
+            codeSpaceHeap.front()->largestFree < requiredSize)
         {
-            CodeSpace *space = cSpaces[i];
-            if (space->largestFree >= requiredSize)
-            {
-                POLYUNSIGNED actualLargest = 0;
-                while (space->firstFree < space->top)
-                {
-                    PolyObject *obj = (PolyObject*)(space->firstFree+1);
-                    // Skip over allocated areas or free areas that are too small.
-                    if (obj->IsCodeObject() || obj->Length() < 8)
-                        space->firstFree += obj->Length()+1;
-                    else break;
-                }
-                PolyWord *pt = space->firstFree;
-                while (pt < space->top)
-                {
-                    PolyObject *obj = (PolyObject*)(pt+1);
-                    POLYUNSIGNED length = obj->Length();
-                    if (obj->IsByteObject())
-                    {
-                        if (length >= requiredSize)
-                        {
-                            // Free and large enough
-                            PolyWord *next = pt+requiredSize+1;
-                            POLYUNSIGNED spare = length - requiredSize;
-#ifdef POLYML32IN64
-                            // Maintain alignment.
-                            if (((requiredSize + 1) & 1) && spare != 0)
-                            {
-                                space->writeAble(next++)[0] = PolyWord::FromUnsigned(0);
-                                spare--;
-                            }
-#endif
-                            if (spare != 0)
-                                FillUnusedSpace(space->writeAble(next), spare);
-                            space->isMutable = true; // Set this - it ensures the area is scanned on GC.
-                            space->headerMap.SetBit(pt-space->bottom); // Set the "header" bit
-                            // Set the length word of the code area and copy the byte cell in.
-                            // The code bit must be set before the lock is released to ensure
-                            // another thread doesn't reuse this.
-                            space->writeAble(obj)->SetLengthWord(requiredSize,  F_CODE_OBJ|F_MUTABLE_BIT);
-                            return obj;
-                        }
-                        else if (length >= actualLargest) actualLargest = length+1;
-                    }
-                    pt += length+1;
-                }
-                // Reached the end without finding what we wanted.  Update the largest size.
-                space->largestFree = actualLargest;
-            }
-            i++; // Next area
-        }
-        else
-        {
-            // Allocate a new area and add it at the end of the table.
             uintptr_t spaceSize = requiredSize + 1;
 #ifdef POLYML32IN64
-            // We need to allow for the extra alignment word otherwise we
-            // may allocate less than we need.
+            // Allow for the extra alignment word.
             spaceSize += 1;
 #endif
             CodeSpace *allocSpace = NewCodeSpace(spaceSize);
@@ -893,6 +837,59 @@ PolyObject* MemMgr::AllocCodeSpace(POLYUNSIGNED requiredSize)
                 return 0; // Try a GC.
             globalStats.incSize(PSS_CODE_SPACE, allocSpace->spaceSize() * sizeof(PolyWord));
         }
+
+        // Keep the candidate at the end until its bound has been updated.
+        // Re-inserting it cannot allocate, including when memory is exhausted.
+        std::pop_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
+        CodeSpace *space = codeSpaceHeap.back();
+        POLYUNSIGNED actualLargest = 0;
+        while (space->firstFree < space->top)
+        {
+            PolyObject *obj = (PolyObject*)(space->firstFree+1);
+            if (obj->IsCodeObject() || obj->Length() < 8)
+                space->firstFree += obj->Length()+1;
+            else break;
+        }
+        PolyWord *pt = space->firstFree;
+        while (pt < space->top)
+        {
+            PolyObject *obj = (PolyObject*)(pt+1);
+            POLYUNSIGNED length = obj->Length();
+            if (obj->IsByteObject())
+            {
+                if (length >= requiredSize)
+                {
+                    PolyWord *next = pt+requiredSize+1;
+                    POLYUNSIGNED spare = length - requiredSize;
+#ifdef POLYML32IN64
+                    // Maintain alignment.
+                    if (((requiredSize + 1) & 1) && spare != 0)
+                    {
+                        space->writeAble(next++)[0] = PolyWord::FromUnsigned(0);
+                        spare--;
+                    }
+#endif
+                    if (spare != 0)
+                        FillUnusedSpace(space->writeAble(next), spare);
+                    if (pt == space->firstFree)
+                        space->firstFree = next;
+                    if (pt + length + 1 == space->top)
+                        space->largestFree = spare > actualLargest ? spare - 1 : actualLargest;
+                    space->isMutable = true; // Ensure the area is scanned on GC.
+                    space->headerMap.SetBit(pt-space->bottom);
+                    // Set the code bit before releasing the lock so another
+                    // thread cannot reuse the allocated block.
+                    space->writeAble(obj)->SetLengthWord(requiredSize, F_CODE_OBJ|F_MUTABLE_BIT);
+                    std::push_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
+                    return obj;
+                }
+                else if (length > actualLargest) actualLargest = length;
+            }
+            pt += length+1;
+        }
+        // A failed upper bound must fall below requiredSize before reinsertion.
+        space->largestFree = actualLargest;
+        std::push_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
     }
 }
 
@@ -917,6 +914,10 @@ void MemMgr::RemoveEmptyCodeAreas()
         }
         else i++;
     }
+    // All code-mark workers have joined.  Their bounds may have changed and
+    // deleted spaces must leave the index.  Its existing capacity is sufficient.
+    codeSpaceHeap.assign(cSpaces.begin(), cSpaces.end());
+    std::make_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
 }
 
 // Add a code space to the tables.  Used both for newly compiled code and also demoted saved spaces.
@@ -925,6 +926,14 @@ bool MemMgr::AddCodeSpace(CodeSpace *space)
     try {
         AddTree(space);
         cSpaces.push_back(space);
+        try {
+            codeSpaceHeap.push_back(space);
+        }
+        catch (std::exception&) {
+            cSpaces.pop_back();
+            throw;
+        }
+        std::push_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
     }
     catch (std::exception&) {
         RemoveTree(space);

@@ -449,6 +449,9 @@ private:
     bool AddLocalSpace(LocalMemSpace *space);
     bool AddCodeSpace(CodeSpace *space);
 
+    // Non-owning free-space index, protected by codeSpaceLock or stop-the-world GC.
+    std::vector<CodeSpace *> codeSpaceHeap;
+
     uintptr_t reservedSpace;
     unsigned nextAllocator;
     // The default size in words when creating new segments.
