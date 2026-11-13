@@ -144,6 +144,8 @@ typedef char TCHAR;
 
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolySaveStateWithModules(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyShowModuleDependencies(POLYUNSIGNED threadId, POLYUNSIGNED arg);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyLoadState(POLYUNSIGNED threadId, POLYUNSIGNED arg);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetHierarchy(POLYUNSIGNED threadId);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyRenameParent(POLYUNSIGNED threadId, POLYUNSIGNED childName, POLYUNSIGNED parentName);
@@ -186,10 +188,13 @@ private:
 
 #define SAVEDSTATESIGNATURE "POLYSAVE"
 #define SAVEDSTATEVERSION   3
+// Version 4 adds a module table: the modules the state depends on.  It is written
+// only when the table is non-empty so other states keep the version 3 layout.
+#define SAVEDSTATEVERSIONWITHMODULES   4
 
 // File header for a saved state file.  This appears as the first entry
 // in the file.
-typedef struct _savedStateHeader
+typedef struct _savedStateHeaderV3
 {
     // These entries are primarily to check that we have a valid
     // saved state file before we try to interpret anything else.
@@ -207,7 +212,26 @@ typedef struct _savedStateHeader
     struct _moduleId      timeStamp;            // The time stamp for this file.
     struct _moduleId      parentTimeStamp;      // The time stamp for the parent.
     void       *originalBaseAddr;        // Original base address (32-in-64 only)
-} SavedStateHeader;
+} SavedStateHeaderV3;
+
+// Version 4 header: the version 3 fields followed by the module table.
+typedef struct _savedStateHeaderV4
+{
+    SavedStateHeaderV3 v3;
+    off_t       moduleTable;            // Position of the module table
+    unsigned    moduleTableCount;       // Number of entries in the module table
+} SavedStateHeaderV4;
+
+// An entry in the module table is this followed by pathLength bytes of the path.
+typedef struct _moduleTableEntry
+{
+    struct _moduleId    modId;          // The id the module had when the state was saved
+    unsigned            pathLength;     // Length of the path in bytes, without a terminator
+} ModuleTableEntry;
+
+// The header as read.  For a version 3 file the module table fields are zero.
+typedef SavedStateHeaderV4 SavedStateHeader;
+
 
 // Entry for segment table.  This describes the segments on the disc that
 // need to be loaded into memory.
@@ -241,6 +265,57 @@ typedef struct _relocationEntry
     ScanRelocationKind relKind;         // The kind of relocation (processor dependent).
 } RelocationEntry;
 
+// Read and check a saved state header.  Returns an error message or NULL.
+static const char* readStateHeader(FILE* f, SavedStateHeader* header)
+{
+    memset(header, 0, sizeof(SavedStateHeader));
+    if (fread(&header->v3, sizeof(SavedStateHeaderV3), 1, f) != 1)
+        return "Unable to load header";
+    if (strncmp(header->v3.headerSignature, SAVEDSTATESIGNATURE, sizeof(header->v3.headerSignature)) != 0)
+        return "File is not a saved state";
+    bool isV3 = header->v3.headerVersion == SAVEDSTATEVERSION &&
+        header->v3.headerLength == sizeof(SavedStateHeaderV3);
+    bool isV4 = header->v3.headerVersion == SAVEDSTATEVERSIONWITHMODULES &&
+        header->v3.headerLength == sizeof(SavedStateHeaderV4);
+    if (!(isV3 || isV4) || header->v3.segmentDescrLength != sizeof(SavedStateSegmentDescr))
+        return "Unsupported version of saved state file";
+    if (isV4 &&
+        fread((char*)header + sizeof(SavedStateHeaderV3), sizeof(SavedStateHeaderV4) - sizeof(SavedStateHeaderV3), 1, f) != 1)
+        return "Unable to load header";
+    return NULL;
+}
+
+// A module table entry as read.
+class ModuleTableItem {
+public:
+    ModuleId modId;
+    std_tstring path;
+};
+
+// Read the module table of a saved state.  Returns an error message or NULL.
+static const char* readModuleTable(FILE* f, const SavedStateHeader* header, std::vector<ModuleTableItem>& table)
+{
+    if (header->moduleTableCount == 0)
+        return NULL;
+    if (fseek(f, header->moduleTable, SEEK_SET) != 0)
+        return "Unable to read module table";
+    table.reserve(header->moduleTableCount);
+    for (unsigned i = 0; i < header->moduleTableCount; i++)
+    {
+        ModuleTableEntry entry;
+        if (fread(&entry, sizeof(entry), 1, f) != 1)
+            return "Unable to read module table";
+        std::string path(entry.pathLength, '\0');
+        if (entry.pathLength != 0 && fread(&path[0], 1, entry.pathLength, f) != entry.pathLength)
+            return "Unable to read module table";
+        ModuleTableItem item;
+        item.modId = ModuleId(entry.modId);
+        item.path = std_tstring((TCHAR*)path.data(), entry.pathLength / sizeof(TCHAR));
+        table.push_back(item);
+    }
+    return NULL;
+}
+
 #define SAVE(x) taskData->saveVec.push(x)
 
 /*
@@ -260,6 +335,7 @@ public:
 
     std_tstring         fileName;
     struct _moduleId    timeStamp;
+    std::vector<ModuleId> modules; // The modules in this level's module table.
 };
 
 std::vector <HierarchyTable> hierarchyTable;
@@ -271,6 +347,8 @@ class LoadedModuleData {
 public:
     ModuleId modId;
     std::vector<ModuleId> modDependencies;
+    // The file the module was loaded from.  Empty if this process stored it.
+    std_tstring fileName;
 };
 
 static std::vector<LoadedModuleData> loadedModules;
@@ -327,13 +405,15 @@ static bool sameFile(const char *x, const char *y)
 class SaveRequest : public MainThreadRequest, public StateExport
 {
 public:
-    SaveRequest(const TCHAR* name, unsigned h) : MainThreadRequest(MTP_SAVESTATE),
-        fileName(name), newHierarchy(h), relocationCount(0) {
+    SaveRequest(const TCHAR* name, unsigned h, bool withMods) : MainThreadRequest(MTP_SAVESTATE),
+        fileName(name), newHierarchy(h), withModules(withMods), relocationCount(0) {
     }
 
     virtual void Perform();
     const TCHAR* fileName;
     unsigned newHierarchy;
+    // If true, modules loaded from files are dependencies rather than copied.
+    bool withModules;
 
 public:
     virtual void exportStore(void) {} // Not used.
@@ -517,6 +597,31 @@ void SaveRequest::Perform()
         // Include any existing states at a higher level
         for (unsigned i = 0; i < newHierarchy - 1; i++)
             copyScan.dependencies[hierarchyTable[i].timeStamp] = true;
+        // The modules this state depends on that no retained level recorded.
+        std::vector<const LoadedModuleData*> moduleTable;
+        if (withModules)
+        {
+            std::map<ModuleId, bool> recorded;
+            for (unsigned i = 0; i < newHierarchy - 1; i++)
+                for (std::vector<ModuleId>::const_iterator m = hierarchyTable[i].modules.cbegin(); m != hierarchyTable[i].modules.cend(); m++)
+                    recorded[*m] = true;
+            // A module is a dependency if it was loaded from a file and everything it depends on
+            // is retained.  Modules are loaded after their dependencies so one pass in load order is enough.
+            for (std::vector<LoadedModuleData>::const_iterator m = loadedModules.cbegin(); m != loadedModules.cend(); m++)
+            {
+                if (m->fileName.empty()) continue;
+                bool depsRetained = true;
+                for (std::vector<ModuleId>::const_iterator d = m->modDependencies.cbegin(); d != m->modDependencies.cend(); d++)
+                {
+                    std::map<ModuleId, bool>::const_iterator f = copyScan.dependencies.find(*d);
+                    if (f == copyScan.dependencies.end() || !f->second) { depsRetained = false; break; }
+                }
+                if (!depsRetained) continue;
+                copyScan.dependencies[m->modId] = true;
+                if (recorded.find(m->modId) == recorded.end())
+                    moduleTable.push_back(&*m);
+            }
+        }
         copyScan.initialise();
 
         bool success = true;
@@ -636,13 +741,15 @@ void SaveRequest::Perform()
 
         // TODO: We should handle write failures e.g. if the disc becomes full.
 
-        // Write out the file header.
-        SavedStateHeader saveHeader;
-        memset(&saveHeader, 0, sizeof(saveHeader));
-        saveHeader.headerLength = sizeof(saveHeader);
+        // Write out the file header.  The version 4 layout only if there is a module table.
+        SavedStateHeaderV4 fullHeader;
+        memset(&fullHeader, 0, sizeof(fullHeader));
+        SavedStateHeaderV3& saveHeader = fullHeader.v3;
+        size_t headerSize = moduleTable.empty() ? sizeof(SavedStateHeaderV3) : sizeof(SavedStateHeaderV4);
+        saveHeader.headerLength = (unsigned)headerSize;
         memcpy(saveHeader.headerSignature,
             SAVEDSTATESIGNATURE, sizeof(saveHeader.headerSignature));
-        saveHeader.headerVersion = SAVEDSTATEVERSION;
+        saveHeader.headerVersion = moduleTable.empty() ? SAVEDSTATEVERSION : SAVEDSTATEVERSIONWITHMODULES;
         saveHeader.segmentDescrLength = sizeof(SavedStateSegmentDescr);
         if (newHierarchy == 1)
             saveHeader.parentTimeStamp = exportSignature;
@@ -657,7 +764,7 @@ void SaveRequest::Perform()
         saveHeader.originalBaseAddr = globalHeapBase;
 #endif
         // Write out the header.
-        fwrite(&saveHeader, sizeof(saveHeader), 1, exportFile);
+        fwrite(&fullHeader, headerSize, 1, exportFile);
 
         // We need a segment header for each permanent area whether it is
         // actually in this file or not.
@@ -743,9 +850,26 @@ void SaveRequest::Perform()
             return;
         }
 
+        // The module table, if any.
+        if (!moduleTable.empty())
+        {
+            fullHeader.moduleTable = ftell(exportFile);
+            fullHeader.moduleTableCount = (unsigned)moduleTable.size();
+            for (std::vector<const LoadedModuleData*>::const_iterator m = moduleTable.cbegin(); m != moduleTable.cend(); m++)
+            {
+                ModuleTableEntry entry;
+                memset(&entry, 0, sizeof(entry));
+                entry.modId = (*m)->modId;
+                entry.pathLength = (unsigned)((*m)->fileName.size() * sizeof(TCHAR));
+                if (!checkedFwrite(&entry, sizeof(entry), 1) ||
+                    !checkedFwrite((*m)->fileName.data(), 1, entry.pathLength))
+                    return;
+            }
+        }
+
         // Rewrite the header and the segment tables now they're complete.
         fseek(exportFile, 0, SEEK_SET);
-        if (!checkedFwrite(&saveHeader, sizeof(saveHeader), 1))
+        if (!checkedFwrite(&fullHeader, headerSize, 1))
             return;
         if (!checkedFwrite(descrs.data(), sizeof(SavedStateSegmentDescr), memTableEntries))
             return;
@@ -754,7 +878,10 @@ void SaveRequest::Perform()
             Log("SAVE: Writing complete.\n");
 
         // Add an entry to the hierarchy table for this file.
-        hierarchyTable.push_back(HierarchyTable(fileName, saveHeader.timeStamp));
+        HierarchyTable level(fileName, saveHeader.timeStamp);
+        for (std::vector<const LoadedModuleData*>::const_iterator m = moduleTable.cbegin(); m != moduleTable.cend(); m++)
+            level.modules.push_back((*m)->modId);
+        hierarchyTable.push_back(level);
 
         CheckMemory();
     }
@@ -766,7 +893,7 @@ void SaveRequest::Perform()
 }
 
 // Write a saved state file.
-POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth)
+static POLYUNSIGNED saveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth, bool withModules)
 {
     TaskData *taskData = TaskData::FindTaskForId(threadId);
     ASSERT(taskData != 0);
@@ -786,7 +913,7 @@ POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNS
         // the GC will delete them if they are completely empty
         FullGC(taskData);
 
-        SaveRequest request(fileNameBuff, newHierarchy);
+        SaveRequest request(fileNameBuff, newHierarchy, withModules);
         processes->MakeRootRequest(taskData, &request);
         if (request.errorMessage)
             raise_syscall(taskData, request.errorMessage, request.errNumber);
@@ -797,6 +924,17 @@ POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNS
     taskData->saveVec.reset(reset);
     taskData->PostRTSCall();
     return TAGGED(0).AsUnsigned();
+}
+
+POLYUNSIGNED PolySaveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth)
+{
+    return saveState(threadId, fileName, depth, false);
+}
+
+// Save a state that refers to the modules loaded from files instead of copying their data.
+POLYUNSIGNED PolySaveStateWithModules(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLYUNSIGNED depth)
+{
+    return saveState(threadId, fileName, depth, true);
 }
 
 /*
@@ -814,6 +952,7 @@ public:
     bool isHierarchy;
     Handle fileNameList;
     const char *errorResult;
+    std::string errorBuffer; // Holds errorResult when it is constructed.
     // The fileName here is the last file loaded.  As well as using it
     // to load the name can also be printed out at the end to identify the
     // particular file in the hierarchy that failed.
@@ -916,6 +1055,10 @@ size_t readData(void *ptr, size_t size, FILE *stream)
 #endif
 }
 
+static bool isModuleLoaded(ModuleId modId);
+static bool loadModuleFile(const std_tstring& fileName, const ModuleId* requiredId,
+    const char*& errorResult, int& errNumber, PolyObject*& root, ModuleId& loadedId);
+
 // Load a saved state file.  Calls itself to handle parent files.
 bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail)
 {
@@ -929,25 +1072,12 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         return false;
     }
 
-    SavedStateHeader header;
+    SavedStateHeader fullHeader;
     // Read the header and check the signature.
-    if (fread(&header, sizeof(SavedStateHeader), 1, loadFile) != 1)
-    {
-        errorResult = "Unable to load header";
+    errorResult = readStateHeader(loadFile, &fullHeader);
+    if (errorResult != NULL)
         return false;
-    }
-    if (strncmp(header.headerSignature, SAVEDSTATESIGNATURE, sizeof(header.headerSignature)) != 0)
-    {
-        errorResult = "File is not a saved state";
-        return false;
-    }
-    if (header.headerVersion != SAVEDSTATEVERSION ||
-        header.headerLength != sizeof(SavedStateHeader) ||
-        header.segmentDescrLength != sizeof(SavedStateSegmentDescr))
-    {
-        errorResult = "Unsupported version of saved state file";
-        return false;
-    }
+    SavedStateHeaderV3& header = fullHeader.v3;
 
     // Check that we have the required stamp before loading any children.
     // If a parent has been overwritten we could get a loop.
@@ -1044,6 +1174,32 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
 
     }
 
+    // Load the modules this state depends on that aren't already loaded.  This is done
+    // after the parents are loaded because loading the top-level state unloads all modules.
+    std::vector<ModuleTableItem> moduleTable;
+    errorResult = readModuleTable(loadFile, &fullHeader, moduleTable);
+    if (errorResult != NULL)
+        return false;
+    std::vector<ModuleId> levelModules;
+    for (std::vector<ModuleTableItem>::const_iterator m = moduleTable.cbegin(); m != moduleTable.cend(); m++)
+    {
+        levelModules.push_back(m->modId);
+        if (isModuleLoaded(m->modId))
+            continue;
+        const char* modError = NULL;
+        int modErrNumber = 0;
+        PolyObject* root;
+        ModuleId loadedId;
+        if (!loadModuleFile(m->path, &m->modId, modError, modErrNumber, root, loadedId))
+        {
+            errorBuffer = "Required module missing or changed: ";
+            errorBuffer += std::string((const char*)m->path.c_str(), m->path.size() * sizeof(TCHAR));
+            errorResult = errorBuffer.c_str();
+            errNumber = 0;
+            return false;
+        }
+    }
+
     // Now have a valid, matching saved state.
     // Load the segment descriptors.
     std::vector<SavedStateSegmentDescr> descrs;
@@ -1078,8 +1234,8 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         if (space != NULL) // An existing segment.  If it's mutable we might be overwriting it.
             load.targetAddr = space->bottom;
 
-        if (descr->segmentData == 0)
-        { // No data - just an entry in the index.
+        if (descr->segmentData == 0 || (descr->segmentFlags & SSF_OVERWRITE))
+        { // No data - just an entry in the index - or data that overwrites an existing space.
             if (space == NULL/* ||
                 descr->segmentSize != (size_t)((char*)space->top - (char*)space->bottom)*/)
             {
@@ -1087,7 +1243,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
                 return false;
             }
         }
-        else if ((descr->segmentFlags & SSF_OVERWRITE) == 0)
+        else
         { // New segment.
             if (space != NULL)
             {
@@ -1181,7 +1337,9 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     }
 
     // Add an entry to the hierarchy table for this file.
-    hierarchyTable.push_back(HierarchyTable(thisFile, header.timeStamp));
+    HierarchyTable level(thisFile, header.timeStamp);
+    level.modules = levelModules;
+    hierarchyTable.push_back(level);
 
     return true; // Succeeded
 }
@@ -1328,20 +1486,12 @@ static void RenameParent(TaskData *taskData, PolyWord childName, PolyWord parent
         raise_syscall(taskData, buff, ERRORNUMBER);
     }
 
-    SavedStateHeader header;
+    SavedStateHeader fullHeader;
     // Read the header and check the signature.
-    if (fread(&header, sizeof(SavedStateHeader), 1, loadFile) != 1)
-        raise_fail(taskData, "Unable to load header");
-
-    if (strncmp(header.headerSignature, SAVEDSTATESIGNATURE, sizeof(header.headerSignature)) != 0)
-        raise_fail(taskData, "File is not a saved state");
-
-    if (header.headerVersion != SAVEDSTATEVERSION ||
-        header.headerLength != sizeof(SavedStateHeader) ||
-        header.segmentDescrLength != sizeof(SavedStateSegmentDescr))
-    {
-        raise_fail(taskData, "Unsupported version of saved state file");
-    }
+    const char* headerError = readStateHeader(loadFile, &fullHeader);
+    if (headerError != NULL)
+        raise_fail(taskData, headerError);
+    SavedStateHeaderV3& header = fullHeader.v3;
 
     // Does this actually have a parent?
     if (header.parentNameEntry == 0)
@@ -1360,7 +1510,7 @@ static void RenameParent(TaskData *taskData, PolyWord childName, PolyWord parent
 
     // Now rewind and write the header with the revised string table.
     fseek(loadFile, 0, SEEK_SET);
-    fwrite(&header, sizeof(header), 1, loadFile);
+    fwrite(&fullHeader, header.headerLength, 1, loadFile);
 }
 
 POLYUNSIGNED PolyRenameParent(POLYUNSIGNED threadId, POLYUNSIGNED childName, POLYUNSIGNED parentName)
@@ -1402,20 +1552,12 @@ static Handle ShowParent(TaskData *taskData, Handle hFileName)
         raise_syscall(taskData, buff, ERRORNUMBER);
     }
 
-    SavedStateHeader header;
+    SavedStateHeader fullHeader;
     // Read the header and check the signature.
-    if (fread(&header, sizeof(SavedStateHeader), 1, loadFile) != 1)
-        raise_fail(taskData, "Unable to load header");
-
-    if (strncmp(header.headerSignature, SAVEDSTATESIGNATURE, sizeof(header.headerSignature)) != 0)
-        raise_fail(taskData, "File is not a saved state");
-
-    if (header.headerVersion != SAVEDSTATEVERSION ||
-        header.headerLength != sizeof(SavedStateHeader) ||
-        header.segmentDescrLength != sizeof(SavedStateSegmentDescr))
-    {
-        raise_fail(taskData, "Unsupported version of saved state file");
-    }
+    const char* headerError = readStateHeader(loadFile, &fullHeader);
+    if (headerError != NULL)
+        raise_fail(taskData, headerError);
+    SavedStateHeaderV3& header = fullHeader.v3;
 
     // Does this have a parent?
     if (header.parentNameEntry != 0)
@@ -1457,6 +1599,78 @@ POLYUNSIGNED PolyShowParent(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 
     try {
         result = ShowParent(taskData, pushedArg);
+    }
+    catch (const std::bad_alloc&) { setMemoryException(taskData); }
+    catch (...) {} // If an ML exception is raised
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
+}
+
+
+// Return the module table of a saved state: the modules it depends on that its parents don't record.
+static Handle ShowModuleDependencies(TaskData *taskData, Handle hFileName)
+{
+    AutoFree<TCHAR*> fileNameBuff(Poly_string_to_T_alloc(hFileName->Word()));
+    if (fileNameBuff == NULL)
+        raise_syscall(taskData, "Insufficient memory", NOMEMORY);
+
+    AutoClose loadFile(_tfopen(fileNameBuff, _T("rb")));
+    if ((FILE*)loadFile == NULL)
+    {
+        AutoFree<char*> buff((char *)malloc(23 + _tcslen(fileNameBuff) * sizeof(TCHAR) + 1));
+        if (buff == NULL)
+            raise_syscall(taskData, "Insufficient memory", NOMEMORY);
+#if (defined(_WIN32) && defined(UNICODE))
+        sprintf(buff, "Cannot open load file: %S", (TCHAR *)fileNameBuff);
+#else
+        sprintf(buff, "Cannot open load file: %s", (TCHAR *)fileNameBuff);
+#endif
+        raise_syscall(taskData, buff, ERRORNUMBER);
+    }
+
+    SavedStateHeader header;
+    const char* error = readStateHeader(loadFile, &header);
+    if (error != NULL)
+        raise_fail(taskData, error);
+    std::vector<ModuleTableItem> table;
+    error = readModuleTable(loadFile, &header, table);
+    if (error != NULL)
+        raise_fail(taskData, error);
+
+    // Build the list in reverse so it is in table order.
+    Handle reset = taskData->saveVec.mark();
+    Handle list = SAVE(ListNull);
+    for (std::vector<ModuleTableItem>::reverse_iterator i = table.rbegin(); i != table.rend(); i++)
+    {
+        Handle idHandle = moduleIdAsByteVector(taskData, i->modId);
+        Handle nameHandle = SAVE(C_string_to_Poly(taskData, i->path.c_str()));
+        Handle pairHandle = alloc_and_save(taskData, 2);
+        pairHandle->WordP()->Set(0, idHandle->Word());
+        pairHandle->WordP()->Set(1, nameHandle->Word());
+        Handle next = alloc_and_save(taskData, sizeof(ML_Cons_Cell) / sizeof(PolyWord));
+        DEREFLISTHANDLE(next)->h = pairHandle->Word();
+        DEREFLISTHANDLE(next)->t = list->Word();
+        // Reset the save vec to keep it bounded.
+        taskData->saveVec.reset(reset);
+        list = SAVE(next->Word());
+    }
+    return list;
+}
+
+POLYUNSIGNED PolyShowModuleDependencies(POLYUNSIGNED threadId, POLYUNSIGNED arg)
+{
+    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+    Handle pushedArg = taskData->saveVec.push(arg);
+    Handle result = 0;
+
+    try {
+        result = ShowModuleDependencies(taskData, pushedArg);
     }
     catch (const std::bad_alloc&) { setMemoryException(taskData); }
     catch (...) {} // If an ML exception is raised
@@ -1543,7 +1757,7 @@ class ModuleExporter : public MainThreadRequest, public StateExport
 {
 public:
     ModuleExporter(const TCHAR* file, Handle r) :
-        MainThreadRequest(MTP_STOREMODULE), fileName(file), root(r), relocationCount(0) {
+        MainThreadRequest(MTP_STOREMODULE), fileName(file), root(r), relocationCount(0), pointerWords(0) {
     }
 
     virtual void Perform();
@@ -1559,6 +1773,10 @@ public:
 protected:
     void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
     unsigned relocationCount;
+    // While set, the offsets and sizes of the data pointers relocated in the current segment.
+    // They are written as zero so that the file does not depend on addresses.
+    std::vector<std::pair<POLYUNSIGNED, size_t> >* pointerWords;
+    bool writeSegmentWithoutPointers(const ExportMemTable* entry, const std::vector<std::pair<POLYUNSIGNED, size_t> >& pointers);
 
     friend class SaveRequest;
 };
@@ -1577,6 +1795,57 @@ void ModuleExporter::createActualRelocation(void* addr, void* relocAddr, ScanRel
     reloc.relKind = kind;
     fwrite(&reloc, sizeof(reloc), 1, exportFile);
     relocationCount++;
+    if (pointerWords != 0 && kind == PROCESS_RELOC_DIRECT)
+        pointerWords->push_back(std::make_pair(reloc.relocAddress, sizeof(void*)));
+    else if (pointerWords != 0 && kind == PROCESS_RELOC_C32ADDR)
+        pointerWords->push_back(std::make_pair(reloc.relocAddress, sizeof(PolyWord)));
+}
+
+// Write a segment's data with the given pointer words set to zero.  The loader sets
+// every one of them from its relocation entry.
+bool ModuleExporter::writeSegmentWithoutPointers(const ExportMemTable* entry, const std::vector<std::pair<POLYUNSIGNED, size_t> >& pointers)
+{
+    std::vector<char> buffer((char*)entry->mtOriginalAddr, (char*)entry->mtOriginalAddr + entry->mtLength);
+    for (std::vector<std::pair<POLYUNSIGNED, size_t> >::const_iterator i = pointers.cbegin(); i != pointers.cend(); i++)
+    {
+        ASSERT(i->first + i->second <= buffer.size());
+        memset(&buffer[i->first], 0, i->second);
+    }
+    return buffer.empty() || checkedFwrite(buffer.data(), buffer.size(), 1);
+}
+
+// A 64-bit hash of the contents of a file, used as a module id.
+static bool hashFile(FILE* f, struct _moduleId& result)
+{
+    if (fflush(f) != 0 || fseek(f, 0, SEEK_SET) != 0)
+        return false;
+    const uint64_t prime1 = 0x9E3779B185EBCA87ULL, prime2 = 0xC2B2AE3D27D4EB4FULL;
+    uint64_t h = prime1, length = 0;
+    std::vector<unsigned char> buff(1024 * 1024);
+    size_t n;
+    while ((n = fread(buff.data(), 1, buff.size(), f)) > 0)
+    {
+        length += n;
+        // Hash in 8-byte words, padding the final one with zeros.
+        for (size_t i = 0; i < n; i += 8)
+        {
+            uint64_t w = 0;
+            for (size_t j = 0; j < 8 && i + j < n; j++)
+                w |= (uint64_t)buff[i + j] << (8 * j);
+            w *= prime2; w = (w << 31) | (w >> 33); w *= prime1;
+            h ^= w;
+            h = ((h << 27) | (h >> 37)) * prime1 + 0x85EBCA77C2B2AE63ULL;
+        }
+    }
+    if (ferror(f))
+        return false;
+    h ^= length;
+    h ^= h >> 33; h *= prime2; h ^= h >> 29; h *= 0x165667B19E3779F9ULL; h ^= h >> 32;
+    result.modA = (uint32_t)(h >> 32);
+    result.modB = (uint32_t)h;
+    if (result.modA == 0 && result.modB == 0)
+        result.modB = 1; // Zero is not a valid id.
+    return true;
 }
 
 // This is called by the initial thread to actually do the export.
@@ -1584,6 +1853,8 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
 {
     PolyObject* copiedRoot = 0;
     CopyScan copyScan;
+    // The module's layout must not depend on this process's heap.
+    copyScan.fixedSegmentSizes = true;
 
     // Set the dependencies.  These are included first since the caller may have provided names.
     copyScan.dependencies[exportSignature] = true; // Always include the executable
@@ -1650,7 +1921,9 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         return;
     }
 
-    exportModId = copyScan.extractHash();
+    // The module id is a hash of the file contents, computed once they have been written.
+    // Until then it is zero, and it is written as zero in the file that is hashed.
+    exportModId = ModuleId();
 
     // Copy the areas into the export object.
     size_t tableSize = gMem.eSpaces.size() + gMem.pSpaces.size();
@@ -1766,6 +2039,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                 thisDescr->relocations = ftell(this->exportFile);
                 // Have to write this out.
                 this->relocationCount = 0;
+                std::vector<std::pair<POLYUNSIGNED, size_t> > pointers;
                 // Create the relocation table.
                 char* start = (char*)entry->mtOriginalAddr;
                 char* end = start + entry->mtLength;
@@ -1778,13 +2052,17 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                     // in code but it's easier if we do for modules.
                     if (length != 0 && obj->IsCodeObject())
                         machineDependent->ScanConstantsWithinCode(obj, this);
+                    // Data pointers are written as zero.  Pointers within code are written as they are.
+                    if (!obj->IsCodeObject())
+                        pointerWords = &pointers;
                     relocateObject(obj);
+                    pointerWords = 0;
                     p += length;
                 }
                 thisDescr->relocationCount = this->relocationCount;
                 // Write out the data.
                 thisDescr->segmentData = ftell(exportFile);
-                if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
+                if (!writeSegmentWithoutPointers(entry, pointers))
                     throw IOException();
             }
         }
@@ -1830,12 +2108,41 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
             throw IOException();
 
+        // The id is the hash of the file written so far, with the id fields zero.
+        // Write it into the header and into the descriptors of this module's own segments.
+        struct _moduleId contentId;
+        if (!hashFile(exportFile, contentId))
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Error while reading module file";
+            throw IOException();
+        }
+        exportModId = ModuleId(contentId);
+        modHeader.thisModuleId = contentId;
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
+            descrs[k].moduleIden = contentId;
+        fseek(exportFile, 0, SEEK_SET);
+        if (!checkedFwrite(&modHeader, sizeof(modHeader), 1))
+            throw IOException();
+        if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
+            throw IOException();
+
         fclose(exportFile); exportFile = NULL;
+
+        // If a module with the same content is already loaded its data is already in this process.
+        // Leave the copied data in local memory rather than having two modules with one id.
+        if (isModuleLoaded(exportModId))
+        {
+            CopyScan::revertToLocal();
+            return;
+        }
+        for (std::vector<PermanentMemSpace*>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
+            (*i)->moduleIdentifier = exportModId;
 
         // Add this to the loaded module table.
         LoadedModuleData loadMod;
         loadMod.modId = exportModId;
-        loadMod.modDependencies.resize(dependencies.size());
+        loadMod.modDependencies.reserve(dependencies.size());
         for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
             loadMod.modDependencies.push_back(i->modId);
         loadedModules.push_back(loadMod);
@@ -1860,9 +2167,9 @@ void ModuleExporter::Perform()
 {
     try {
 #if (defined(_WIN32) && defined(UNICODE))
-        exportFile = _wfopen(fileName, L"wb");
+        exportFile = _wfopen(fileName, L"w+b");
 #else
-        exportFile = fopen(fileName, "wb");
+        exportFile = fopen(fileName, "w+b"); // Read back to compute the module id.
 #endif
         if (exportFile == NULL)
         {
@@ -2009,15 +2316,26 @@ public:
     PolyWord* targetAddr;           // Actual address of the segment
 };
 
-void ModuleLoader::Perform()
+static bool isModuleLoaded(ModuleId modId)
 {
-    try {
+    for (std::vector<LoadedModuleData>::const_iterator i = loadedModules.cbegin(); i != loadedModules.cend(); i++)
+        if (i->modId == modId) return true;
+    return false;
+}
+
+// Load a module file.  Must be called by the root thread.  If requiredId is not NULL the module
+// must have that id.  Returns true and sets root and loadedId if it succeeded.  The caller is
+// responsible for keeping the root reachable if it needs it.
+static bool loadModuleFile(const std_tstring& fileName, const ModuleId* requiredId,
+    const char*& errorResult, int& errNumber, PolyObject*& root, ModuleId& loadedId)
+{
+    {
         AutoClose loadFile(_tfopen(fileName.c_str(), _T("rb")));
         if ((FILE*)loadFile == NULL)
         {
             errorResult = "Cannot open load file";
             errNumber = ERRORNUMBER;
-            return;
+            return false;
         }
 
         ModuleHeader header;
@@ -2025,19 +2343,24 @@ void ModuleLoader::Perform()
         if (fread(&header, sizeof(ModuleHeader), 1, loadFile) != 1)
         {
             errorResult = "Unable to load header";
-            return;
+            return false;
         }
         if (strncmp(header.headerSignature, MODULESIGNATURE, sizeof(header.headerSignature)) != 0)
         {
             errorResult = "File is not a Poly/ML module";
-            return;
+            return false;
         }
         if (header.headerVersion != MODULEVERSION ||
             header.headerLength != sizeof(ModuleHeader) ||
             header.segmentDescrLength != sizeof(ModuleSegmentDescr))
         {
             errorResult = "Unsupported version of module file";
-            return;
+            return false;
+        }
+        if (requiredId != NULL && ModuleId(header.thisModuleId) != *requiredId)
+        {
+            errorResult = "Module has a different id";
+            return false;
         }
         // Check to see if this is already loaded
         for (std::vector<LoadedModuleData>::iterator i = loadedModules.begin(); i < loadedModules.end(); i++)
@@ -2045,7 +2368,7 @@ void ModuleLoader::Perform()
             if (i->modId == header.thisModuleId)
             {
                 errorResult = "A module with this signature is already loaded";
-                return;
+                return false;
             }
         }
         if (ModuleId(header.executableModId) != exportSignature)
@@ -2053,19 +2376,20 @@ void ModuleLoader::Perform()
             // Time-stamp does not match executable.
             errorResult =
                 "Module was exported from a different executable or the executable has changed";
-            return;
+            return false;
         }
 
         // Add to the loaded module table
         LoadedModuleData loadMod;
         loadMod.modId = header.thisModuleId;
-        loadMod.modDependencies.resize(header.dependencyCount);
+        loadMod.fileName = fileName;
+        loadMod.modDependencies.reserve(header.dependencyCount);
 
         // Get the dependencies.  This is only needed to fill in the dependency vector.
         if (fseek(loadFile, header.dependencies, SEEK_SET) != 0)
         {
             errorResult = "Unable to access dependency table";
-            return;
+            return false;
         }
         for (unsigned i = 0; i < header.dependencyCount; i++)
         {
@@ -2073,7 +2397,7 @@ void ModuleLoader::Perform()
             if (fread(&modDepEntry, sizeof(ModDependencyEntry), 1, loadFile) != 1)
             {
                 errorResult = "Unable to load dependency entry";
-                return;
+                return false;
             }
             loadMod.modDependencies.push_back(modDepEntry.depId);
         }
@@ -2088,7 +2412,7 @@ void ModuleLoader::Perform()
         if (fseek(loadFile, header.segmentDescr, SEEK_SET) != 0)
         {
             errorResult = "Unable to read segment descriptors";
-            return;
+            return false;
         }
         for (unsigned i = 0; i < header.segmentDescrCount; i++)
         {
@@ -2096,7 +2420,7 @@ void ModuleLoader::Perform()
             if (fread(&msd, sizeof(ModuleSegmentDescr), 1, loadFile) != 1)
             {
                 errorResult = "Unable to read segment descriptors";
-                return;
+                return false;
             }
             descrs.push_back(msd);
         }
@@ -2118,7 +2442,7 @@ void ModuleLoader::Perform()
                 if (space == NULL)
                 {
                     errorResult = "Required memory space is not present";
-                    return;
+                    return false;
                 }
                 load.targetAddr = space->bottom;
             }
@@ -2127,7 +2451,7 @@ void ModuleLoader::Perform()
                 if (space != NULL)
                 {
                     errorResult = "Memory space with this signature already exists";
-                    return;
+                    return false;
                 }
                 // Allocate memory for the new segment.
                 unsigned mFlags =
@@ -2142,17 +2466,17 @@ void ModuleLoader::Perform()
                 if (newSpace == 0)
                 {
                     errorResult = "Unable to allocate memory";
-                    return;
+                    return false;
                 }
                 if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
                 {
                     errorResult = "Unable to seek to segment";
-                    return;
+                    return false;
                 }
                 if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
                 {
                     errorResult = "Unable to read segment";
-                    return;
+                    return false;
                 }
                 if (newSpace->isMutable && (descr->segmentFlags & MSF_BYTES) != 0)
                 {
@@ -2188,18 +2512,31 @@ void ModuleLoader::Perform()
             }
         }
 
-        // Get the root address.  Push this to the caller's save vec.  If we put the
-        // newly created areas into local memory we could get a GC as soon as we
-        // complete this root request.
+        // Get the root address.
         {
             ASSERT(header.rootSegment < header.segmentDescrCount);
             PolyWord* baseAddr = loadData[header.rootSegment].targetAddr;
-            rootHandle = callerTaskData->saveVec.push((PolyObject*)((byte*)baseAddr + header.rootOffset));
+            root = (PolyObject*)((byte*)baseAddr + header.rootOffset);
         }
-        loadedModId = header.thisModuleId;
+        loadedId = header.thisModuleId;
 
         // Now add the entry to the loaded module table
         loadedModules.push_back(loadMod);
+    }
+    return errorResult == NULL;
+}
+
+void ModuleLoader::Perform()
+{
+    try {
+        PolyObject* root;
+        if (loadModuleFile(fileName, NULL, errorResult, errNumber, root, loadedModId))
+        {
+            // Push the root to the caller's save vec.  If we put the
+            // newly created areas into local memory we could get a GC as soon as we
+            // complete this root request.
+            rootHandle = callerTaskData->saveVec.push(root);
+        }
     }
     catch (const std::bad_alloc&)
     {
@@ -2500,6 +2837,8 @@ POLYUNSIGNED PolyReleaseModule(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 struct _entrypts savestateEPT[] =
 {
     { "PolySaveState",                  (polyRTSFunction)&PolySaveState },
+    { "PolySaveStateWithModules",       (polyRTSFunction)&PolySaveStateWithModules },
+    { "PolyShowModuleDependencies",     (polyRTSFunction)&PolyShowModuleDependencies },
     { "PolyLoadState",                  (polyRTSFunction)&PolyLoadState },
     { "PolyGetHierarchy",               (polyRTSFunction)&PolyGetHierarchy },
     { "PolyRenameParent",               (polyRTSFunction)&PolyRenameParent },

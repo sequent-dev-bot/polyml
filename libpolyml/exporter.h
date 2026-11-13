@@ -29,6 +29,7 @@
 #endif
 
 #include <map>
+#include <vector>
 
 class SaveVecEntry;
 typedef SaveVecEntry *Handle;
@@ -88,6 +89,12 @@ protected:
     unsigned memTableEntries;
     PolyObject *rootFunction; // Address of the root function.
     ModuleId exportModId;
+
+private:
+    // Indexes of the non-empty memTable entries sorted by address, for findArea.
+    // Built on first use once memTableEntries is set.
+    std::vector<unsigned> sortedAreas;
+    unsigned sortedAreasFor;
 };
 
 // The object-code exporters all use a similar string table format
@@ -122,6 +129,9 @@ class CopyScan: public ScanAddress
 public:
     CopyScan(bool isExp=false);
     void initialise();
+    // If true, initialise uses constant segment sizes instead of ones that depend on the heap,
+    // so that the layout of the copy depends only on what is copied.
+    bool fixedSegmentSizes;
     ~CopyScan();
 protected:
     virtual POLYUNSIGNED ScanAddressAt(PolyWord *pt);

@@ -59,6 +59,7 @@
 #define _tcscat strcat
 #endif
 
+#include <algorithm>
 #include "exporter.h"
 #include "save_vec.h"
 #include "polystring.h"
@@ -136,6 +137,7 @@ public:
 CopyScan::CopyScan(bool isExp /*=false*/)
 {
     isExport = isExp;
+    fixedSegmentSizes = false;
     defaultImmSize = defaultMutSize = defaultCodeSize = defaultNoOverSize = 0;
     tombs = 0;
     graveYard = 0;
@@ -257,6 +259,11 @@ void CopyScan::initialise()
         if (defaultImmSize > 1024 * 1024) defaultImmSize = 1024 * 1024;
         if (defaultCodeSize > 1024 * 1024) defaultCodeSize = 1024 * 1024;
         if (defaultNoOverSize > 1024 * 1024) defaultNoOverSize = 1024 * 1024;
+    }
+    if (fixedSegmentSizes)
+    {
+        // The maximum size used for saved states, which is what a large heap gives.
+        defaultImmSize = defaultMutSize = defaultCodeSize = defaultNoOverSize = 1024 * 1024;
     }
     if (debugOptions & DEBUG_SAVING)
         Log("SAVE: Copyscan default sizes: Immutable: %" POLYUFMT ", Mutable: %" POLYUFMT ", Code: %" POLYUFMT ", No-overwrite %" POLYUFMT ".\n",
@@ -998,7 +1005,8 @@ POLYUNSIGNED PolyExportPortable(POLYUNSIGNED threadId, POLYUNSIGNED fileName, PO
 
 // Helper functions for exporting.  We need to produce relocation information
 // and this code is common to every method.
-Exporter::Exporter(): exportFile(NULL), errorMessage(0), errNumber(0), memTable(0), memTableEntries(0), rootFunction(0)
+Exporter::Exporter(): exportFile(NULL), errorMessage(0), errNumber(0), memTable(0), memTableEntries(0), rootFunction(0),
+    sortedAreasFor(0)
 {
 }
 
@@ -1027,10 +1035,29 @@ void Exporter::createRelocation(PolyWord* pt)
 // in one of them.
 unsigned Exporter::findArea(void *p)
 {
-    for (unsigned i = 0; i < memTableEntries; i++)
+    // Binary search of the areas sorted by address.  An address is in an area
+    // if it is above its start and no further than its end.
+    if (sortedAreasFor != memTableEntries)
     {
-        if (p > memTable[i].mtOriginalAddr &&
-            p <= (char*)memTable[i].mtOriginalAddr + memTable[i].mtLength)
+        sortedAreas.clear();
+        for (unsigned i = 0; i < memTableEntries; i++)
+            if (memTable[i].mtLength != 0) sortedAreas.push_back(i);
+        ExportMemTable *table = memTable;
+        std::sort(sortedAreas.begin(), sortedAreas.end(),
+            [table](unsigned a, unsigned b) { return table[a].mtOriginalAddr < table[b].mtOriginalAddr; });
+        sortedAreasFor = memTableEntries;
+    }
+    // Find the last area whose start is below p.
+    size_t lo = 0, hi = sortedAreas.size();
+    while (lo < hi)
+    {
+        size_t mid = lo + (hi - lo) / 2;
+        if (memTable[sortedAreas[mid]].mtOriginalAddr < p) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0)
+    {
+        unsigned i = sortedAreas[lo - 1];
+        if (p <= (char*)memTable[i].mtOriginalAddr + memTable[i].mtLength)
             return i;
     }
     { ASSERT(0); }

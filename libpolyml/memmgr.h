@@ -26,6 +26,8 @@
 #include "osmem.h"
 #include "../polyexports.h" // For struct _moduleId
 #include <vector>
+#include <map>
+#include <utility>
 
 // utility conversion macros
 #define Words_to_K(w) (w*sizeof(PolyWord))/1024
@@ -403,6 +405,9 @@ public:
 
     // Table for permanent spaces
     std::vector<PermanentMemSpace *> pSpaces;
+    // Index of pSpaces by (module id, index), for SpaceForIndex.
+    std::map<std::pair<ModuleId, unsigned>, PermanentMemSpace *> pSpaceIndex;
+    void AddPermanentSpace(PermanentMemSpace *space);
 
     // Table for local spaces
     std::vector<LocalMemSpace *> lSpaces;

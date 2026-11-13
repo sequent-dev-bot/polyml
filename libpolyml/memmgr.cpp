@@ -321,7 +321,7 @@ PermanentMemSpace* MemMgr::PermanentSpaceFromExecutable(PolyWord *base, uintptr_
         // Extend the permanent memory table and add this space to it.
         try {
             AddTree(space);
-            pSpaces.push_back(space);
+            AddPermanentSpace(space);
         }
         catch (std::exception&) {
             RemoveTree(space);
@@ -366,7 +366,7 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
         // Extend the permanent memory table and add this space to it.
         try {
             AddTree(space);
-            pSpaces.push_back(space);
+            AddPermanentSpace(space);
         }
         catch (std::exception&) {
             RemoveTree(space);
@@ -591,6 +591,10 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                     currentHeapSize += space->spaceSize();
                     globalStats.setSize(PSS_TOTAL_HEAP, currentHeapSize * sizeof(PolyWord));
                 }
+                std::map<std::pair<ModuleId, unsigned>, PermanentMemSpace*>::iterator ix =
+                    pSpaceIndex.find(std::make_pair(pSpace->moduleIdentifier, pSpace->index));
+                if (ix != pSpaceIndex.end() && ix->second == pSpace)
+                    pSpaceIndex.erase(ix);
                 i = pSpaces.erase(i);
             }
             catch (std::bad_alloc&) {
@@ -614,23 +618,27 @@ bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
         if (space->topPointer != space->top)
             FillUnusedSpace(space->writeAble(space->topPointer), space->top - space->topPointer);
         // Put in a dummy object to fill the rest of the space.
-        pSpaces.push_back(space);
+        AddPermanentSpace(space);
     }
     eSpaces.clear();
 
     return true;
 }
 
+// Add a space to the permanent space table and its index.  If two spaces have the same
+// module id and index the first one added is found, as with a linear search.
+void MemMgr::AddPermanentSpace(PermanentMemSpace *space)
+{
+    pSpaces.push_back(space);
+    pSpaceIndex.insert(std::make_pair(std::make_pair(space->moduleIdentifier, space->index), space));
+}
+
 // Return the space for a given index
 PermanentMemSpace *MemMgr::SpaceForIndex(unsigned index, ModuleId modId)
 {
-    for (std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin(); i < pSpaces.end(); i++)
-    {
-        PermanentMemSpace *space = *i;
-        if (space->index == index && space->moduleIdentifier == modId)
-            return space;
-    }
-    return NULL;
+    std::map<std::pair<ModuleId, unsigned>, PermanentMemSpace*>::iterator i =
+        pSpaceIndex.find(std::make_pair(modId, index));
+    return i == pSpaceIndex.end() ? NULL : i->second;
 }
 
 // In several places we assume that segments are filled with valid
