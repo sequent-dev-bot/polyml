@@ -600,7 +600,7 @@ void CopyScan::ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthWord)
             deferred.push_back(std::make_pair(base, lengthWord));
         }
         catch (const std::bad_alloc&) {
-            // The callers catch MemoryException and undo the copy.
+            // Report it as newAddressForObject reports running out of space.
             throw MemoryException();
         }
         return;
