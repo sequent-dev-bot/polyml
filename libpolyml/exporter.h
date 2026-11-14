@@ -29,6 +29,8 @@
 #endif
 
 #include <map>
+#include <utility>
+#include <vector>
 
 class SaveVecEntry;
 typedef SaveVecEntry *Handle;
@@ -128,7 +130,14 @@ protected:
     // Have to follow pointers from closures into code.
     virtual POLYUNSIGNED ScanCodeAddressAt(PolyObject **pt);
     POLYUNSIGNED ScanAddress(PolyObject **pt);
+    // Bounds the recursion on the C stack: see exporter.cpp.
+    virtual void ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthWord);
+    using ScanAddress::ScanAddressesInObject;
 private:
+    // Objects left to scan once the recursion has unwound, and the current depth.
+    std::vector<std::pair<PolyObject*, POLYUNSIGNED> > deferred;
+    unsigned depth;
+
     enum _newAddrType {
         NAWord,
         NAMutable,

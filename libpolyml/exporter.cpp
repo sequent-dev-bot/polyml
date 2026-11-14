@@ -136,6 +136,7 @@ public:
 CopyScan::CopyScan(bool isExp /*=false*/)
 {
     isExport = isExp;
+    depth = 0;
     defaultImmSize = defaultMutSize = defaultCodeSize = defaultNoOverSize = 0;
     tombs = 0;
     graveYard = 0;
@@ -582,6 +583,52 @@ POLYUNSIGNED CopyScan::ScanCodeAddressAt(PolyObject **pt)
     if (lengthWord)
         ScanAddressesInObject(*pt, lengthWord);
     return 0;
+}
+
+// The generic ScanAddressesInObject recurses for every field but the last
+// that holds an object still to copy, so a deeply nested value (a long chain
+// through a first field) would overflow the C stack.  Past MAX_COPY_DEPTH
+// levels, objects are queued instead and scanned once the recursion unwinds.
+// Only the order of scanning changes, and only for values that deep.
+#define MAX_COPY_DEPTH 10000
+
+void CopyScan::ScanAddressesInObject(PolyObject *base, POLYUNSIGNED lengthWord)
+{
+    if (depth >= MAX_COPY_DEPTH)
+    {
+        try {
+            deferred.push_back(std::make_pair(base, lengthWord));
+        }
+        catch (const std::bad_alloc&) {
+            // The callers catch MemoryException and undo the copy.
+            throw MemoryException();
+        }
+        return;
+    }
+    if (depth != 0)
+    {
+        depth++;
+        ScanAddress::ScanAddressesInObject(base, lengthWord);
+        depth--;
+        return;
+    }
+    // The outermost call: scan the object, then everything queued meanwhile.
+    try {
+        depth = 1;
+        ScanAddress::ScanAddressesInObject(base, lengthWord);
+        while (! deferred.empty())
+        {
+            std::pair<PolyObject*, POLYUNSIGNED> next = deferred.back();
+            deferred.pop_back();
+            ScanAddress::ScanAddressesInObject(next.first, next.second);
+        }
+        depth = 0;
+    }
+    catch (...) {
+        depth = 0;
+        deferred.clear();
+        throw;
+    }
 }
 
 PolyObject *CopyScan::ScanObjectAddress(PolyObject *base)
