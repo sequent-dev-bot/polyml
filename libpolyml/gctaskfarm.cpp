@@ -47,6 +47,7 @@
 #include "gctaskfarm.h"
 #include "diagnostics.h"
 #include "timing.h"
+#include "sighandler.h"
 
 static GCTaskId gTask;
 
@@ -153,6 +154,10 @@ void GCTaskFarm::ThreadFunction()
 #ifdef HAVE_PTHREAD_JIT_WRITE_PROTECT_NP
     // On MacOS this thread needs to be marked to write rather than execute.
     pthread_jit_write_protect_np(false);
+#endif
+#if (!defined(_WIN32))
+    // Lasts as long as the thread.
+    installSignalStack();
 #endif
     GCTaskId myTaskId;
 #if (defined(_WIN32))
