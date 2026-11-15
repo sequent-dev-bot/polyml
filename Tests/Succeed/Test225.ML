@@ -1,15 +1,20 @@
-(* A fatal signal must leave a trace: on Linux the runtime writes the signal,
-   the faulting address and registers and a backtrace to stderr, then dies by
-   the same signal so the parent still sees it.  A child poly calls strlen on
-   a null pointer through the foreign function interface, so the fault is in
-   C code. *)
+(* A fatal signal must leave a trace: on Linux with glibc the runtime writes
+   the signal, the faulting address and registers and a backtrace to stderr,
+   then dies by the same signal so the parent still sees it.  A child poly
+   calls strlen on a null pointer through the foreign function interface, so
+   the fault is in C code. *)
 case (#lookupStruct (PolyML.globalNameSpace) "Unix",
       #lookupStruct (PolyML.globalNameSpace) "Foreign") of
     (SOME _, SOME _) => ()
 |   _ => raise NotApplicable;
+(* The runtime installs the handler only on Linux with glibc. *)
 case List.find (fn (key, _) => key = "sysname") (Posix.ProcEnv.uname ()) of
     SOME (_, "Linux") => ()
 |   _ => raise NotApplicable;
+val _ =
+    Foreign.symbolAsAddress
+        (Foreign.getSymbol (Foreign.loadExecutable ()) "gnu_get_libc_version")
+    handle Foreign.Foreign _ => raise NotApplicable;
 
 val crash =
     "val strlen = Foreign.buildCall1\n\
