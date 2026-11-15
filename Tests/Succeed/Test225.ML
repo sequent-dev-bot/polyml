@@ -7,7 +7,9 @@ case (#lookupStruct (PolyML.globalNameSpace) "Unix",
       #lookupStruct (PolyML.globalNameSpace) "Foreign") of
     (SOME _, SOME _) => ()
 |   _ => raise NotApplicable;
-if #sysname (Posix.ProcEnv.uname ()) = "Linux" then () else raise NotApplicable;
+case List.find (fn (key, _) => key = "sysname") (Posix.ProcEnv.uname ()) of
+    SOME (_, "Linux") => ()
+|   _ => raise NotApplicable;
 
 val crash =
     "val strlen = Foreign.buildCall1\n\
