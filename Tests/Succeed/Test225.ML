@@ -31,10 +31,10 @@ val header = "Poly/ML: fatal signal 11 code ";
 val () =
     if String.isSubstring header output then ()
     else raise Fail ("no crash header in the child's stderr: " ^ output);
-(* backtrace_symbols_fd writes each frame as "object(symbol+offset) [0xaddress]". *)
+(* backtrace_symbols_fd writes each frame as "object(symbol+offset)[0xaddress]". *)
 val afterHeader = #2 (Substring.position header (Substring.full output));
 val () =
-    if String.isSubstring ") [0x" (Substring.string afterHeader) then ()
+    if String.isSubstring ")[0x" (Substring.string afterHeader) then ()
     else raise Fail ("no backtrace after the crash header: " ^ output);
 val () =
     case Posix.Process.fromStatus status of
