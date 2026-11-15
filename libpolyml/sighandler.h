@@ -40,6 +40,8 @@ extern void init_asyncmask(sigset_t *mask);
 typedef void (*signal_handler_type)(SIG_HANDLER_ARGS(s, c));
 
 extern bool setSignalHandler(int sig, signal_handler_type func);
+// Give the calling thread an alternate signal stack; returns it or 0.
+extern void *installSignalStack(void);
 // Set up per-thread signal data: basically signal stack.
 extern void initThreadSignals(TaskData *taskData);
 

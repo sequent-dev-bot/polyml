@@ -65,6 +65,15 @@
 #include <stdlib.h> // For malloc
 #endif
 
+#if (defined(__linux__) && defined(__GLIBC__))
+// Fatal signals print a backtrace to stderr before the process dies.
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <stdint.h>
+#define HAVE_CRASH_BACKTRACE 1
+#endif
+
 #if (defined(HAVE_SEMAPHORE_H) && !defined(_WIN32))
 // Don't include semaphore.h on Mingw.  It's provided but doesn't compile.
 #include <semaphore.h>
@@ -344,6 +353,35 @@ POLYUNSIGNED PolyWaitForSignal(POLYUNSIGNED threadId)
     else return result->Word().AsUnsigned();
 }
 
+// Give the calling thread an alternate signal stack and return it, or 0 where
+// none is used.  It is large enough for the crash handler's backtrace.
+void *installSignalStack(void)
+{
+#if (!(defined(_WIN32)||defined(MACOSX)) && defined(SA_ONSTACK) && defined(HAVE_SIGALTSTACK))
+    size_t size = SIGSTKSZ; // May be a call to sysconf
+    if (size < 65536) size = 65536;
+    void *stack = malloc(size);
+    if (stack == 0) return 0;
+#ifdef HAVE_STACK_T
+    stack_t ex_stack;
+#else
+    // This used to be used in FreeBSD and Mac OS X
+    struct sigaltstack ex_stack;
+#endif
+    memset(&ex_stack, 0, sizeof(ex_stack));
+    // Cast to char* because ss_sp is char* in FreeBSD.
+    // Linux simply casts it back to void*.
+    ex_stack.ss_sp    = (char*)stack;
+    ex_stack.ss_size  = size;
+    ex_stack.ss_flags = 0; /* not SS_DISABLE */
+    int sigaltstack_result = sigaltstack(&ex_stack, NULL);
+    ASSERT(sigaltstack_result == 0);
+    return stack;
+#else
+    return 0;
+#endif
+}
+
 // Set up per-thread signal data: basically signal stack.
 // This is really only needed for profiling timer signals.
 void initThreadSignals(TaskData *taskData)
@@ -362,23 +400,7 @@ void initThreadSignals(TaskData *taskData)
     // whole process and crash with an illegal instruction on the
     // second signal.  This isn't currently a problem since only the
     // main thread receives signals in Mac OS X.
-#if (defined(SA_ONSTACK) && defined(HAVE_SIGALTSTACK))
-    taskData->signalStack = malloc(SIGSTKSZ);
-#ifdef HAVE_STACK_T
-    stack_t ex_stack;
-#else
-    // This used to be used in FreeBSD and Mac OS X
-    struct sigaltstack ex_stack;
-#endif
-    memset(&ex_stack, 0, sizeof(ex_stack));
-    // Cast to char* because ss_sp is char* in FreeBSD.
-    // Linux simply casts it back to void*.
-    ex_stack.ss_sp    = (char*)taskData->signalStack;
-    ex_stack.ss_size  = SIGSTKSZ;
-    ex_stack.ss_flags = 0; /* not SS_DISABLE */
-    int sigaltstack_result = sigaltstack(&ex_stack, NULL);
-    ASSERT(sigaltstack_result == 0);
-#endif
+    taskData->signalStack = installSignalStack();
 #endif /* not the PC */
 #if (!defined(_WIN32))
     // Block all signals except those marked as in use by the RTS so
@@ -525,6 +547,102 @@ static void *SignalDetectionThread(void *)
 }
 #endif
 
+#ifdef HAVE_CRASH_BACKTRACE
+static uintptr_t crashImageBase;
+static const char *crashImageName = "";
+
+// Append to a fixed buffer without allocating: these run in a signal handler.
+static void appendText(char *buf, size_t size, size_t *pos, const char *text)
+{
+    while (*text != 0 && *pos < size) buf[(*pos)++] = *text++;
+}
+
+static void appendNumber(char *buf, size_t size, size_t *pos, uintptr_t value, unsigned base)
+{
+    char digits[2 * sizeof(uintptr_t) * 4 + 1];
+    size_t n = sizeof(digits) - 1;
+    digits[n] = 0;
+    do {
+        digits[--n] = "0123456789abcdef"[value % base];
+        value /= base;
+    } while (value != 0);
+    appendText(buf, size, pos, digits + n);
+}
+
+// SIGSEGV, SIGBUS and SIGILL: write where the fault happened and a backtrace
+// to stderr, then die by the same signal so the parent still sees it.
+static void crashHandler(int sig, siginfo_t *info, void *context)
+{
+    ucontext_t *uc = (ucontext_t *)context;
+    char line[1024];
+    size_t size = sizeof(line) - 1, pos = 0;
+    appendText(line, size, &pos, "Poly/ML: fatal signal ");
+    appendNumber(line, size, &pos, sig, 10);
+    appendText(line, size, &pos, " code ");
+    if (info->si_code < 0)
+    {
+        appendText(line, size, &pos, "-");
+        appendNumber(line, size, &pos, -info->si_code, 10);
+    }
+    else appendNumber(line, size, &pos, info->si_code, 10);
+    appendText(line, size, &pos, " addr 0x");
+    appendNumber(line, size, &pos, (uintptr_t)info->si_addr, 16);
+#if defined(__aarch64__)
+    appendText(line, size, &pos, " pc 0x");
+    appendNumber(line, size, &pos, uc->uc_mcontext.pc, 16);
+    appendText(line, size, &pos, " sp 0x");
+    appendNumber(line, size, &pos, uc->uc_mcontext.sp, 16);
+    appendText(line, size, &pos, " lr 0x");
+    appendNumber(line, size, &pos, uc->uc_mcontext.regs[30], 16);
+#elif defined(__x86_64__)
+    appendText(line, size, &pos, " pc 0x");
+    appendNumber(line, size, &pos, uc->uc_mcontext.gregs[REG_RIP], 16);
+    appendText(line, size, &pos, " sp 0x");
+    appendNumber(line, size, &pos, uc->uc_mcontext.gregs[REG_RSP], 16);
+#endif
+    appendText(line, size, &pos, " base 0x");
+    appendNumber(line, size, &pos, crashImageBase, 16);
+    appendText(line, size, &pos, " ");
+    appendText(line, size, &pos, crashImageName);
+    line[pos++] = '\n';
+    ssize_t written = write(STDERR_FILENO, line, pos);
+    (void)written;
+
+    void *frames[64];
+    int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+
+    // SA_RESETHAND has restored the default action.
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, sig);
+    pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+    raise(sig);
+}
+
+static void installCrashHandler(void)
+{
+    Dl_info self;
+    if (dladdr((void*)crashHandler, &self) != 0)
+    {
+        crashImageBase = (uintptr_t)self.dli_fbase;
+        if (self.dli_fname != 0) crashImageName = self.dli_fname;
+    }
+    // The first backtrace loads the unwinder, which allocates: do it now.
+    void *warmUp[1];
+    backtrace(warmUp, 1);
+
+    struct sigaction crash;
+    memset(&crash, 0, sizeof(crash));
+    crash.sa_sigaction = crashHandler;
+    sigemptyset(&crash.sa_mask);
+    crash.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigaction(SIGSEGV, &crash, NULL);
+    sigaction(SIGBUS, &crash, NULL);
+    sigaction(SIGILL, &crash, NULL);
+}
+#endif
+
 void SigHandler::Init(void)
 {
     // Mark certain signals as non-maskable since they really
@@ -539,6 +657,11 @@ void SigHandler::Init(void)
     sigData[SIGILL].nonMaskable = true;
 #endif
 #if (!defined(_WIN32))
+    // This is the root thread, which runs the GC, saving states and modules.
+    installSignalStack();
+#ifdef HAVE_CRASH_BACKTRACE
+    installCrashHandler();
+#endif
     static PSemaphore waitSemaphore;
     // Initialise the "wait" semaphore so that it blocks immediately.
     if (! waitSemaphore.Init(0, NSIG)) return;
