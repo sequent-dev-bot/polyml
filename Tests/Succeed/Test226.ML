@@ -34,13 +34,13 @@ fun str s = "\"" ^ String.toString s ^ "\"";
 
 val saveParent =
     "val xs = List.tabulate (100000, fn i => (i, Int.toString i));\n\
-    \val () = PolyML.SaveState.saveChild (" ^ str parentFile ^ ", 1);\n\
+    \val () = PolyML.SaveState.saveChild (" ^ str parentFile ^ ", 0);\n\
     \val () = OS.Process.exit OS.Process.success;\n";
 
 val saveChild =
     "val () = PolyML.SaveState.loadState " ^ str parentFile ^ ";\n\
     \val ys = map (fn (i, s) => (s, i * 2)) xs;\n\
-    \val () = PolyML.SaveState.saveChild (" ^ str childFile ^ ", 2);\n\
+    \val () = PolyML.SaveState.saveChild (" ^ str childFile ^ ", 1);\n\
     \val () = OS.Process.exit OS.Process.success;\n";
 
 (* Lines of /proc/self/maps naming each state file, and the values. *)
@@ -71,9 +71,9 @@ val loadRelocated =
     \val mmap = buildCall6 (getSymbol (loadExecutable ()) \"mmap\",\n\
     \    (cPointer, cSize, cInt, cInt, cInt, cInt64), cPointer)\n\
     \end;\n\
-    \val base = Memory.sysWord2VoidStar 0wx200000000000;\n\
+    \val base = Foreign.Memory.sysWord2VoidStar 0wx200000000000;\n\
     \val r = mmap (base, 0x100000000000, 0, 0x2 + 0x20 + 0x4000 + 0x100000, ~1, 0);\n\
-    \val () = if Memory.voidStar2Sysword r = 0wx200000000000 then () else raise Fail \"reserve\";\n" ^
+    \val () = if Foreign.Memory.voidStar2Sysword r = 0wx200000000000 then () else raise Fail \"reserve\";\n" ^
     checkLoaded ^ checkValues ^
     "val () = OS.Process.exit\n\
     \    (if ok andalso mapped " ^ str parentFile ^ " = 0 andalso mapped " ^ str childFile ^ " = 0\n\
