@@ -185,7 +185,7 @@ private:
  */
 
 #define SAVEDSTATESIGNATURE "POLYSAVE"
-#define SAVEDSTATEVERSION   3
+#define SAVEDSTATEVERSION   4
 
 // File header for a saved state file.  This appears as the first entry
 // in the file.
@@ -221,6 +221,7 @@ typedef struct _savedStateSegmentDescr
     unsigned    segmentFlags;           // Segment flags (see SSF_ values)
     unsigned    segmentIndex;           // The index of this segment or the segment it overwrites
     struct _moduleId      moduleId;               // The module this came from.
+    void       *originalAddr;           // Address of the segment when the file was saved
 } SavedStateSegmentDescr;
 
 #define SSF_WRITABLE    1               // The segment contains mutable data
@@ -498,6 +499,11 @@ void SaveRequest::Perform()
             }
         }
 
+#ifdef POLYML_MAP_SAVED_STATES
+        // Other processes may have the existing file mapped: write a new file rather
+        // than truncating theirs, which would raise SIGBUS in them.
+        unlink(fileName);
+#endif
         // Open the file.  This could quite reasonably fail if the path is wrong.
         exportFile = _tfopen(fileName, _T("wb"));
         if (exportFile == NULL)
@@ -675,6 +681,7 @@ void SaveRequest::Perform()
             descr.segmentIndex = (unsigned)entry->mtIndex;
             descr.segmentSize = entry->mtLength; // Set this even if we don't write it.
             descr.moduleId = entry->mtModId;
+            descr.originalAddr = entry->mtOriginalAddr;
             if (entry->mtFlags & MTF_WRITEABLE)
             {
                 descr.segmentFlags |= SSF_WRITABLE;
@@ -719,7 +726,16 @@ void SaveRequest::Perform()
                     p += length;
                 }
                 descrs[k].relocationCount = relocationCount;
-                // Write out the data.
+                // Write out the data, starting at a multiple of 64K so that it can be mapped.
+                static const char zeros[4096] = { 0 };
+                for (off_t pos = ftell(exportFile); pos % (64 * 1024) != 0; )
+                {
+                    size_t pad = (size_t)(64 * 1024 - pos % (64 * 1024));
+                    if (pad > sizeof(zeros)) pad = sizeof(zeros);
+                    if (!checkedFwrite(zeros, pad, 1))
+                        return;
+                    pos += pad;
+                }
                 descrs[k].segmentData = ftell(exportFile);
                 if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
                     return;
@@ -1100,30 +1116,40 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
                 (descr->segmentFlags & SSF_NOOVERWRITE ? MTF_NO_OVERWRITE : 0) |
                 (descr->segmentFlags & SSF_BYTES ? MTF_BYTES : 0) |
                 (descr->segmentFlags & SSF_CODE ? MTF_EXECUTABLE : 0);
-            PermanentMemSpace *newSpace =
-                gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, descr->moduleId);
+            PermanentMemSpace *newSpace = 0;
+#ifdef POLYML_MAP_SAVED_STATES
+            // Map it where it was when saved.  If that address is taken, read it in instead
+            // and let the relocations below adjust it and the pointers to it.
+            if ((descr->segmentFlags & SSF_CODE) == 0)
+                newSpace = gMem.MapPermanentSpace(descr->originalAddr, descr->segmentSize,
+                    fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, descr->moduleId);
+#endif
             if (newSpace == 0)
             {
-                errorResult = "Unable to allocate memory";
-                return false;
-            }
+                newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, descr->moduleId);
+                if (newSpace == 0)
+                {
+                    errorResult = "Unable to allocate memory";
+                    return false;
+                }
 
-            PolyWord *mem  = newSpace->bottom;
-            PolyWord* writeAble = newSpace->writeAble(mem);
-            if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
-            {
-                errorResult = "Unable to seek segment";
-                return false;
+                PolyWord *mem  = newSpace->bottom;
+                PolyWord* writeAble = newSpace->writeAble(mem);
+                if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
+                {
+                    errorResult = "Unable to seek segment";
+                    return false;
+                }
+                if (readData(writeAble, descr->segmentSize, loadFile) != 1)
+                {
+                    errorResult = "Unable to read segment";
+                    return false;
+                }
+                // Fill unused space to the top of the area.
+                gMem.FillUnusedSpace(writeAble +descr->segmentSize/sizeof(PolyWord),
+                    newSpace->spaceSize() - descr->segmentSize/sizeof(PolyWord));
+                // Leave it writable until we've done the relocations.
             }
-            if (readData(writeAble, descr->segmentSize, loadFile) != 1)
-            {
-                errorResult = "Unable to read segment";
-                return false;
-            }
-            // Fill unused space to the top of the area.
-            gMem.FillUnusedSpace(writeAble +descr->segmentSize/sizeof(PolyWord),
-                newSpace->spaceSize() - descr->segmentSize/sizeof(PolyWord));
-            // Leave it writable until we've done the relocations.
 
             if (newSpace->noOverwrite)
             {
@@ -1141,6 +1167,11 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         if (descr->segmentFlags & SSF_OVERWRITE)
         {
             MemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleId);
+            if (space == NULL || descr->segmentSize > (size_t)((char*)space->top - (char*)space->bottom))
+            {
+                errorResult = "Mismatch for existing memory space";
+                return false;
+            }
             if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0 ||
                 fread(space->bottom, descr->segmentSize, 1, loadFile) != 1)
             {
@@ -1150,32 +1181,49 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         }
     }
 
-    // Now the relocations.
-    for (std::vector<StateLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
+    // Now the relocations.  The saved data holds the values it had when saved, so an
+    // entry needs applying only if the segment it is in or the one it points into is
+    // no longer where it was then.
+    std::vector<bool> moved(descrs.size());
+    bool anyMoved = false;
+    for (size_t j = 0; j < descrs.size(); j++)
     {
+        moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
+        anyMoved = anyMoved || moved[j];
+    }
+    std::vector<RelocationEntry> relocBuffer(anyMoved ? 4096 : 0);
+    for (size_t j = 0; j < loadData.size(); j++)
+    {
+        StateLoadData *i = &loadData[j];
         PolyWord* baseAddr = i->targetAddr;
         ASSERT(baseAddr != NULL); // We should have created it.
         // Process explicit relocations.
-        // If we get errors just skip the error and continue rather than leave
-        // everything in an unstable state.
-        if (i->relocations)
+        if (i->relocations && anyMoved)
         {
             if (fseek(loadFile, i->relocations, SEEK_SET) != 0)
             {
                 errorResult = "Unable to read relocation segment";
                 return false;
             }
-            for (unsigned k = 0; k < i->relocationCount; k++)
+            for (unsigned k = 0; k < i->relocationCount; )
             {
-                RelocationEntry reloc;
-                if (fread(&reloc, sizeof(reloc), 1, loadFile) != 1)
+                size_t n = i->relocationCount - k;
+                if (n > relocBuffer.size()) n = relocBuffer.size();
+                if (fread(relocBuffer.data(), sizeof(RelocationEntry), n, loadFile) != n)
                 {
                     errorResult = "Unable to read relocation segment";
                     return false;
                 }
-                byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
-                byte *targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
-                ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                for (size_t r = 0; r < n; r++)
+                {
+                    RelocationEntry &reloc = relocBuffer[r];
+                    if (!moved[j] && !moved[reloc.targetSegment])
+                        continue;
+                    byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
+                    byte *targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
+                    ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                }
+                k += (unsigned)n;
             }
         }
     }
