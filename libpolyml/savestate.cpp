@@ -526,7 +526,9 @@ void SaveRequest::Perform()
             return;
         }
         // Created with at most the old permissions, so no one else can open it meanwhile.
-        int fd = open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode);
+        // A replacement must be a new file: if another save created one since the unlink,
+        // fail rather than truncate that.
+        int fd = open(target.c_str(), O_WRONLY | O_CREAT | (replacing ? O_EXCL : O_TRUNC), mode);
         if (fd >= 0 && ((replacing && fchmod(fd, mode) != 0) || (exportFile = fdopen(fd, "wb")) == NULL))
         {
             int err = errno;
