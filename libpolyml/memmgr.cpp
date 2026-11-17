@@ -49,6 +49,20 @@
 #include "machine_dep.h"
 #include "heapsizing.h"
 
+#ifdef POLYML_MAP_SAVED_STATES
+#include <sys/mman.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000 // Linux 4.17; older kernels treat it as a hint.
+#endif
+// The region new saved-state data segments are allocated in.  It is a convention, not a
+// reservation: ordinary mmap(0, ...) allocations and PIE images lie far above it on
+// x86-64 (47-bit) and Arm64 (48-bit) Linux.  Segment addresses and their offsets in
+// the file are multiples of 64K so that they can be mapped on 4K, 16K and 64K pages.
+static const uintptr_t stateRegionBase = (uintptr_t)0x200000000000;
+static const uintptr_t stateRegionTop = (uintptr_t)0x300000000000;
+static const uintptr_t stateRegionAlign = 64 * 1024;
+#endif
+
 
 #ifdef POLYML32IN64
 // This contains the address of the base of the heap.
@@ -353,7 +367,11 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
         }
         space->bottom = base;
         space->shadowSpace = (PolyWord*)newShadow;
-        space->topPointer = space->top = space->bottom + actualSize/sizeof(PolyWord);
+        space->top = space->bottom + actualSize/sizeof(PolyWord);
+        // The saved length, not the rounded-up one: a child state saved from this process
+        // records this as the length of the parent's segment, and the same segment may
+        // be mapped elsewhere with exactly that length.
+        space->topPointer = space->bottom + byteSize/sizeof(PolyWord);
         space->spaceType = ST_PERMANENT;
         space->isMutable = flags & MTF_WRITEABLE ? true : false;
         space->noOverwrite = flags & MTF_NO_OVERWRITE ? true : false;
@@ -379,6 +397,78 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
         return 0;
     }
 }
+
+#ifdef POLYML_MAP_SAVED_STATES
+PermanentMemSpace *MemMgr::MapPermanentSpace(void *addr, uintptr_t byteSize, int fd, uint64_t offset,
+    unsigned flags, unsigned index, ModuleId sourceModule)
+{
+    void *mem = mmap(addr, byteSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED_NOREPLACE, fd, (off_t)offset);
+    if (mem == MAP_FAILED)
+        return 0;
+    if (mem != addr)
+    {
+        munmap(mem, byteSize);
+        return 0;
+    }
+    PermanentMemSpace *space = 0;
+    try {
+        space = new PermanentMemSpace(&osHeapAlloc); // Freed with munmap.
+        space->bottom = (PolyWord*)mem;
+        space->topPointer = space->top = space->bottom + byteSize/sizeof(PolyWord);
+        space->spaceType = ST_PERMANENT;
+        space->isMutable = flags & MTF_WRITEABLE ? true : false;
+        space->noOverwrite = flags & MTF_NO_OVERWRITE ? true : false;
+        space->byteOnly = flags & MTF_BYTES ? true : false;
+        space->isCode = false;
+        space->index = index;
+        space->moduleIdentifier = sourceModule;
+        if (index >= nextIndex) nextIndex = index + 1;
+        AddTree(space);
+        pSpaces.push_back(space);
+        return space;
+    }
+    catch (std::exception&) {
+        if (space != 0)
+        {
+            RemoveTree(space);
+            delete space;
+        }
+        else munmap(mem, byteSize);
+        return 0;
+    }
+}
+
+// Allocate memory for a new data export space in the saved-state region, above every
+// space already there, so that a child state's segments lie above its parents'.
+// Returns 0 if that fails; the caller then allocates as usual.
+void *MemMgr::AllocateInStateRegion(size_t &space)
+{
+    uintptr_t next = stateRegionBase;
+    std::vector<MemSpace*> spaces(pSpaces.begin(), pSpaces.end());
+    spaces.insert(spaces.end(), eSpaces.begin(), eSpaces.end());
+    spaces.insert(spaces.end(), lSpaces.begin(), lSpaces.end());
+    for (std::vector<MemSpace*>::iterator i = spaces.begin(); i < spaces.end(); i++)
+    {
+        uintptr_t bottom = (uintptr_t)(*i)->bottom, top = (uintptr_t)(*i)->top;
+        if (bottom >= stateRegionBase && bottom < stateRegionTop && top > next)
+            next = top;
+    }
+    next = (next + stateRegionAlign - 1) & ~(stateRegionAlign - 1);
+    size_t size = (space + stateRegionAlign - 1) & ~(stateRegionAlign - 1);
+    if (next + size > stateRegionTop)
+        return 0;
+    void *mem = mmap((void*)next, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON|MAP_FIXED_NOREPLACE, -1, 0);
+    if (mem == MAP_FAILED)
+        return 0;
+    if (mem != (void*)next)
+    {
+        munmap(mem, size);
+        return 0;
+    }
+    space = size;
+    return mem;
+}
+#endif
 
 // Called to set the permissions on permanent spaces from the executable.
 bool MemMgr::CompletePermanentSpaceAllocation(PermanentMemSpace *space)
@@ -441,7 +531,14 @@ PermanentMemSpace* MemMgr::NewExportSpace(uintptr_t size, bool mut, bool noOv, b
             if (space->bottom != 0)
                 space->shadowSpace = (PolyWord*)shadow;
         }
-        else space->bottom = (PolyWord*)alloc->AllocateDataArea(iSpace);
+        else
+        {
+#ifdef POLYML_MAP_SAVED_STATES
+            space->bottom = (PolyWord*)AllocateInStateRegion(iSpace);
+            if (space->bottom == 0)
+#endif
+                space->bottom = (PolyWord*)alloc->AllocateDataArea(iSpace);
+        }
 
         if (space->bottom == 0)
         {

@@ -27,6 +27,13 @@
 #include "../polyexports.h" // For struct _moduleId
 #include <vector>
 
+// Saved-state data segments are allocated in a fixed address region when saving and are
+// mapped from the file at those addresses when loading, so unwritten pages stay shared
+// between processes that load the same file.  Linux, native addresses only.
+#if (defined(__linux__) && !defined(POLYML32IN64))
+#define POLYML_MAP_SAVED_STATES 1
+#endif
+
 // utility conversion macros
 #define Words_to_K(w) (w*sizeof(PolyWord))/1024
 #define Words_to_M(w) (w*sizeof(PolyWord))/(1<<20)
@@ -286,6 +293,12 @@ public:
     PermanentMemSpace *AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule);
     // Called after an allocated permanent area has been filled in.
     bool CompletePermanentSpaceAllocation(PermanentMemSpace *space);
+#ifdef POLYML_MAP_SAVED_STATES
+    // Create a permanent space by mapping byteSize bytes of file fd at offset, privately and
+    // copy-on-write, at exactly addr.  Returns 0, mapping nothing, if that address isn't free.
+    PermanentMemSpace *MapPermanentSpace(void *addr, uintptr_t byteSize, int fd, uint64_t offset,
+        unsigned flags, unsigned index, ModuleId sourceModule);
+#endif
 
     // Delete a local space.  Takes the iterator position in lSpaces and returns the
     // iterator after deletion.
@@ -327,6 +340,11 @@ public:
     void DeleteExportSpaces(void);
     bool PromoteNewExportSpaces(ModuleId newModId); // Turn export spaces into permanent spaces.
     bool DemoteOldPermanentSpaces(ModuleId modId); // Turn any old permanent spaces with this ID into local spaces.
+#ifdef POLYML_MAP_SAVED_STATES
+private:
+    void *AllocateInStateRegion(size_t &space);
+public:
+#endif
 
     PermanentMemSpace *SpaceForIndex(unsigned index, ModuleId modId); // Return the space for a given index
 
