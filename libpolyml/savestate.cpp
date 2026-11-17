@@ -502,7 +502,14 @@ void SaveRequest::Perform()
 #ifdef POLYML_MAP_SAVED_STATES
         // Other processes may have the existing file mapped: write a new file rather
         // than truncating theirs, which would raise SIGBUS in them.
-        unlink(fileName);
+        if (unlink(fileName) != 0 && errno != ENOENT)
+        {
+            errorMessage = "Cannot replace save file";
+            errNumber = ERRORNUMBER;
+            if (debugOptions & DEBUG_SAVING)
+                Log("SAVE: Cannot replace save file.\n");
+            return;
+        }
 #endif
         // Open the file.  This could quite reasonably fail if the path is wrong.
         exportFile = _tfopen(fileName, _T("wb"));
