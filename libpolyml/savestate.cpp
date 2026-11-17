@@ -55,6 +55,14 @@
 #include <unistd.h>
 #endif
 
+#ifdef HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
+
+#ifdef HAVE_STDLIB_H
+#include <stdlib.h>
+#endif
+
 #ifdef HAVE_STRING_H
 #include <string.h>
 #endif
@@ -501,8 +509,15 @@ void SaveRequest::Perform()
 
 #ifdef POLYML_MAP_SAVED_STATES
         // Other processes may have the existing file mapped: write a new file rather
-        // than truncating theirs, which would raise SIGBUS in them.
-        if (unlink(fileName) != 0 && errno != ENOENT)
+        // than truncating theirs, which would raise SIGBUS in them.  As truncating did,
+        // write to the file a symbolic link names and keep the file's permissions.
+        char *existing = realpath(fileName, NULL); // NULL if there's no file yet.
+        std::string target(existing != NULL ? existing : fileName);
+        free(existing);
+        struct stat oldStat;
+        bool replacing = stat(target.c_str(), &oldStat) == 0;
+        mode_t mode = replacing ? (oldStat.st_mode & 0777) : 0666;
+        if (replacing && unlink(target.c_str()) != 0 && errno != ENOENT)
         {
             errorMessage = "Cannot replace save file";
             errNumber = ERRORNUMBER;
@@ -510,9 +525,18 @@ void SaveRequest::Perform()
                 Log("SAVE: Cannot replace save file.\n");
             return;
         }
-#endif
+        // Created with at most the old permissions, so no one else can open it meanwhile.
+        int fd = open(target.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode);
+        if (fd >= 0 && ((replacing && fchmod(fd, mode) != 0) || (exportFile = fdopen(fd, "wb")) == NULL))
+        {
+            int err = errno;
+            close(fd);
+            errno = err;
+        }
+#else
         // Open the file.  This could quite reasonably fail if the path is wrong.
         exportFile = _tfopen(fileName, _T("wb"));
+#endif
         if (exportFile == NULL)
         {
             errorMessage = "Cannot open save file";
@@ -1090,6 +1114,12 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     std::vector<StateLoadData> loadData;
     loadData.reserve(header.segmentDescrCount);
 
+#ifdef POLYML_MAP_SAVED_STATES
+    // Only segments wholly within the file are mapped: a page past the end of a truncated
+    // file would raise SIGBUS when touched.  The read path below reports the short read.
+    struct stat fileStat;
+    uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
+#endif
     // Read in and create the new segments first.  If we have problems,
     // in particular if we have run out of memory, then it's easier to recover.  
     for (std::vector<SavedStateSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
@@ -1127,7 +1157,8 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
 #ifdef POLYML_MAP_SAVED_STATES
             // Map it where it was when saved.  If that address is taken, read it in instead
             // and let the relocations below adjust it and the pointers to it.
-            if ((descr->segmentFlags & SSF_CODE) == 0)
+            if ((descr->segmentFlags & SSF_CODE) == 0 && descr->segmentSize <= fileSize &&
+                    (uint64_t)descr->segmentData <= fileSize - descr->segmentSize)
                 newSpace = gMem.MapPermanentSpace(descr->originalAddr, descr->segmentSize,
                     fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, descr->moduleId);
 #endif
