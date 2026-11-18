@@ -2202,6 +2202,15 @@ in
 
             val saveChild: string * int -> unit = RunCall.rtsCallFull2 "PolySaveState"
 
+            (* Like saveChild but modules loaded from files are not copied into the state.
+               The state records their ids and paths and loading it loads them. *)
+            val saveChildWithModules: string * int -> unit = RunCall.rtsCallFull2 "PolySaveStateWithModules"
+
+            (* The modules recorded in a saved state, with the paths they were loaded from.
+               Parents of the state may record further modules. *)
+            val showModuleDependencies: string -> (moduleId * string) list =
+                RunCall.rtsCallFull1 "PolyShowModuleDependencies"
+
             fun saveState f = saveChild (f, 0);
 
             (* Get the hierarchy with the IDs so they can be passed as dependent modules. *)
