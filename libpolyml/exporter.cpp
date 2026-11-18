@@ -38,6 +38,8 @@
 #include <string.h>
 #endif
 
+#include <algorithm>
+
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
 #endif
@@ -1044,7 +1046,7 @@ POLYUNSIGNED PolyExportPortable(POLYUNSIGNED threadId, POLYUNSIGNED fileName, PO
 
 // Helper functions for exporting.  We need to produce relocation information
 // and this code is common to every method.
-Exporter::Exporter(): exportFile(NULL), errorMessage(0), errNumber(0), memTable(0), memTableEntries(0), rootFunction(0)
+Exporter::Exporter(): exportFile(NULL), errorMessage(0), errNumber(0), memTable(0), memTableEntries(0), rootFunction(0), areasIndexedTable(0), areasIndexedCount(0)
 {
 }
 
@@ -1073,10 +1075,25 @@ void Exporter::createRelocation(PolyWord* pt)
 // in one of them.
 unsigned Exporter::findArea(void *p)
 {
-    for (unsigned i = 0; i < memTableEntries; i++)
+    // Index the table the first time it is searched, or again if it has changed.
+    if (areasIndexedTable != memTable || areasIndexedCount != memTableEntries)
     {
-        if (p > memTable[i].mtOriginalAddr &&
-            p <= (char*)memTable[i].mtOriginalAddr + memTable[i].mtLength)
+        areasByAddress.clear();
+        areasByAddress.reserve(memTableEntries);
+        for (unsigned i = 0; i < memTableEntries; i++)
+            if (memTable[i].mtLength != 0) // An empty area contains nothing.
+                areasByAddress.push_back(std::make_pair((char*)memTable[i].mtOriginalAddr, i));
+        std::sort(areasByAddress.begin(), areasByAddress.end());
+        areasIndexedTable = memTable;
+        areasIndexedCount = memTableEntries;
+    }
+    // The last area starting below p.  Areas don't overlap.
+    std::vector<std::pair<char*, unsigned> >::const_iterator a =
+        std::lower_bound(areasByAddress.begin(), areasByAddress.end(), std::make_pair((char*)p, 0U));
+    if (a != areasByAddress.begin())
+    {
+        unsigned i = (--a)->second;
+        if (p <= (char*)memTable[i].mtOriginalAddr + memTable[i].mtLength)
             return i;
     }
     { ASSERT(0); }
