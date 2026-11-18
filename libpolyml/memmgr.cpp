@@ -51,6 +51,7 @@
 
 #ifdef POLYML_MAP_SAVED_STATES
 #include <sys/mman.h>
+#include <unistd.h>
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000 // Linux 4.17; older kernels treat it as a hint.
 #endif
@@ -335,7 +336,7 @@ PermanentMemSpace* MemMgr::PermanentSpaceFromExecutable(PolyWord *base, uintptr_
         // Extend the permanent memory table and add this space to it.
         try {
             AddTree(space);
-            pSpaces.push_back(space);
+            AddPermanentSpace(space);
         }
         catch (std::exception&) {
             RemoveTree(space);
@@ -384,7 +385,7 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
         // Extend the permanent memory table and add this space to it.
         try {
             AddTree(space);
-            pSpaces.push_back(space);
+            AddPermanentSpace(space);
         }
         catch (std::exception&) {
             RemoveTree(space);
@@ -402,18 +403,23 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
 PermanentMemSpace *MemMgr::MapPermanentSpace(void *addr, uintptr_t byteSize, int fd, uint64_t offset,
     unsigned flags, unsigned index, ModuleId sourceModule)
 {
-    void *mem = mmap(addr, byteSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED_NOREPLACE, fd, (off_t)offset);
+    // Map whole pages: from the page containing addr, at the same distance before offset.
+    uintptr_t delta = (uintptr_t)addr % (uintptr_t)sysconf(_SC_PAGESIZE);
+    if (offset % (uintptr_t)sysconf(_SC_PAGESIZE) != delta)
+        return 0;
+    char *start = (char*)addr - delta;
+    void *mem = mmap(start, byteSize + delta, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED_NOREPLACE, fd, (off_t)(offset - delta));
     if (mem == MAP_FAILED)
         return 0;
-    if (mem != addr)
+    if (mem != start)
     {
-        munmap(mem, byteSize);
+        munmap(mem, byteSize + delta);
         return 0;
     }
     PermanentMemSpace *space = 0;
     try {
-        space = new PermanentMemSpace(&osHeapAlloc); // Freed with munmap.
-        space->bottom = (PolyWord*)mem;
+        space = new PermanentMemSpace(&osHeapAlloc); // Freed with munmap of its pages.
+        space->bottom = (PolyWord*)addr;
         space->topPointer = space->top = space->bottom + byteSize/sizeof(PolyWord);
         space->spaceType = ST_PERMANENT;
         space->isMutable = flags & MTF_WRITEABLE ? true : false;
@@ -424,7 +430,7 @@ PermanentMemSpace *MemMgr::MapPermanentSpace(void *addr, uintptr_t byteSize, int
         space->moduleIdentifier = sourceModule;
         if (index >= nextIndex) nextIndex = index + 1;
         AddTree(space);
-        pSpaces.push_back(space);
+        AddPermanentSpace(space);
         return space;
     }
     catch (std::exception&) {
@@ -433,9 +439,18 @@ PermanentMemSpace *MemMgr::MapPermanentSpace(void *addr, uintptr_t byteSize, int
             RemoveTree(space);
             delete space;
         }
-        else munmap(mem, byteSize);
+        else munmap(mem, byteSize + delta);
         return 0;
     }
+}
+
+// Remove write access to an immutable space made by MapPermanentSpace once it is relocated.
+void MemMgr::WriteProtectMappedSpace(PermanentMemSpace *space)
+{
+    ASSERT(!space->isMutable && !space->isCode);
+    uintptr_t delta = (uintptr_t)space->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
+    if (mprotect((char*)space->bottom - delta, (char*)space->top - (char*)space->bottom + delta, PROT_READ) == 0)
+        space->isWriteProtected = true;
 }
 
 // Allocate memory for a new data export space in the saved-state region, above every
@@ -664,6 +679,17 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                 }
                 else
                 {
+#ifdef POLYML_MAP_SAVED_STATES
+                    // A module segment mapped from its file is write-protected once relocated.
+                    if (pSpace->isWriteProtected)
+                    {
+                        uintptr_t delta = (uintptr_t)pSpace->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
+                        if (mprotect((char*)pSpace->bottom - delta, (char*)pSpace->top - (char*)pSpace->bottom + delta,
+                                PROT_READ|PROT_WRITE) != 0)
+                            return false;
+                        pSpace->isWriteProtected = false;
+                    }
+#endif
                     // Enable write access.  Permanent spaces are read-only.
 //                    osHeapAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
 //                        PERMISSION_READ | PERMISSION_WRITE);
@@ -688,6 +714,7 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                     currentHeapSize += space->spaceSize();
                     globalStats.setSize(PSS_TOTAL_HEAP, currentHeapSize * sizeof(PolyWord));
                 }
+                RemoveFromSpaceIndex(pSpace);
                 i = pSpaces.erase(i);
             }
             catch (std::bad_alloc&) {
@@ -711,7 +738,7 @@ bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
         if (space->topPointer != space->top)
             FillUnusedSpace(space->writeAble(space->topPointer), space->top - space->topPointer);
         // Put in a dummy object to fill the rest of the space.
-        pSpaces.push_back(space);
+        AddPermanentSpace(space);
     }
     eSpaces.clear();
 
@@ -721,13 +748,42 @@ bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
 // Return the space for a given index
 PermanentMemSpace *MemMgr::SpaceForIndex(unsigned index, ModuleId modId)
 {
+    struct _moduleId m = modId;
+    SpaceKey k = { m.modA, m.modB, index };
+    std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash>::iterator i = spaceIndex.find(k);
+    return i == spaceIndex.end() ? NULL : i->second;
+}
+
+// Add a space to pSpaces and its index.  The index holds the first space with a key, as a
+// search of pSpaces in order would find.
+void MemMgr::AddPermanentSpace(PermanentMemSpace *space)
+{
+    pSpaces.push_back(space);
+    try {
+        spaceIndex.emplace(KeyFor(space), space);
+    }
+    catch (...) {
+        pSpaces.pop_back();
+        throw;
+    }
+}
+
+// Called before a space is removed from pSpaces.
+void MemMgr::RemoveFromSpaceIndex(PermanentMemSpace *space)
+{
+    SpaceKey k = KeyFor(space);
+    std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash>::iterator f = spaceIndex.find(k);
+    if (f == spaceIndex.end() || f->second != space)
+        return;
+    spaceIndex.erase(f);
     for (std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin(); i < pSpaces.end(); i++)
     {
-        PermanentMemSpace *space = *i;
-        if (space->index == index && space->moduleIdentifier == modId)
-            return space;
+        if (*i != space && KeyFor(*i) == k)
+        {
+            spaceIndex.emplace(k, *i);
+            break;
+        }
     }
-    return NULL;
 }
 
 // In several places we assume that segments are filled with valid

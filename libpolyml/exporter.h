@@ -109,21 +109,25 @@ public:
 
 // Because permanent immutable areas are read-only we need to
 // have somewhere else to hold the tomb-stones.
+class PermanentMemSpace;
+
 class GraveYard {
 public:
     GraveYard() { graves = 0; }
     ~GraveYard();
     PolyWord *graves;
     PolyWord *startAddr, *endAddr;
+    PermanentMemSpace *space;
 };
-
-class PermanentMemSpace;
 
 class CopyScan: public ScanAddress
 {
 public:
     CopyScan(bool isExp=false);
     void initialise();
+    // Put all immutable non-code objects in one kind of segment, so that a module's immutable
+    // data is a single segment when it fits.  Set before initialise.
+    bool singleImmutableArea;
     ~CopyScan();
 protected:
     virtual POLYUNSIGNED ScanAddressAt(PolyWord *pt);

@@ -76,6 +76,8 @@
 
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <unordered_set>
 
 #if (defined(_WIN32))
 #include <tchar.h>
@@ -283,6 +285,14 @@ public:
 };
 
 static std::vector<LoadedModuleData> loadedModules;
+// The ids in loadedModules, to check quickly whether a module is loaded.
+static std::unordered_set<uint64_t> loadedModuleIds;
+
+static uint64_t ModuleKey(ModuleId m)
+{
+    struct _moduleId id = m;
+    return (uint64_t)id.modA << 32 | id.modB;
+}
 
 class ModIdAndName {
 public:
@@ -1090,6 +1100,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
             gMem.DemoteOldPermanentSpaces(i->modId);
 
         loadedModules.clear();
+        loadedModuleIds.clear();
 
     }
 
@@ -1557,7 +1568,7 @@ POLYUNSIGNED PolyShowParent(POLYUNSIGNED threadId, POLYUNSIGNED arg)
 
 // Module system
 #define MODULESIGNATURE "POLYMODU"
-#define MODULEVERSION   3
+#define MODULEVERSION   4
 
 typedef struct _moduleHeader
 {
@@ -1598,7 +1609,35 @@ typedef struct _moduleSegmentDescr
     unsigned    segmentFlags;           // Segment flags (see MSF_ values)
     unsigned    segmentIndex;           // The index of this segment or the segment it overwrites
     struct _moduleId moduleIden;               // The module this came from.
+    // For a segment in another module or the executable, its address when this module was
+    // written.  For this module's segment, the address its data was prelinked for, or 0 if it
+    // was not: a module's immutable non-code data is prelinked when it is one segment.
+    // A prelinked segment's data holds the pointer values its relocations would set, given
+    // these addresses, so it can be mapped from the file there with no change.
+    uintptr_t   originalAddr;
+    // The relocations are sorted by target segment.  The table starts with relocRunCount
+    // entries of ModRelocationRun, one for each run of relocations to a segment.
+    unsigned    relocRunCount;
 } ModuleSegmentDescr;
+
+typedef struct _modRelocationRun
+{
+    unsigned    targetSegment;
+    unsigned    count;
+} ModRelocationRun;
+
+// The region modules are prelinked for: 16TB above the saved-state region, in 64K slots.
+// A module's segment starts in the slot its id selects, at its file offset modulo 64K so
+// that it can be mapped on 4K, 16K and 64K pages.
+#define MODULE_REGION_BASE  ((uintptr_t)0x300000000000)
+#define MODULE_SLOT_BITS    28
+#define MODULE_SLOT_SIZE    ((uintptr_t)0x10000)
+
+static uintptr_t ModulePrelinkAddress(ModuleId m, uint64_t fileOffset)
+{
+    uint64_t slot = (ModuleKey(m) * 0x9E3779B97F4A7C15ull) >> (64 - MODULE_SLOT_BITS);
+    return MODULE_REGION_BASE + (uintptr_t)slot * MODULE_SLOT_SIZE + (uintptr_t)(fileOffset % MODULE_SLOT_SIZE);
+}
 
 #define MSF_WRITABLE    1               // The segment contains mutable data
 #define MSF_OVERWRITE   2               // The segment overwrites the data (mutable) in a parent.
@@ -1647,6 +1686,7 @@ public:
 protected:
     void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
     unsigned relocationCount;
+    std::vector<ModRelocationEntry> relocations; // For the segment being written.
 
     friend class SaveRequest;
 };
@@ -1663,8 +1703,22 @@ void ModuleExporter::createActualRelocation(void* addr, void* relocAddr, ScanRel
     reloc.targetAddress = (POLYUNSIGNED)((char*)addr - (char*)memTable[addrArea].mtOriginalAddr);
     reloc.targetSegment = addrArea;
     reloc.relKind = kind;
-    fwrite(&reloc, sizeof(reloc), 1, exportFile);
+    relocations.push_back(reloc);
     relocationCount++;
+}
+
+static bool lessTargetSegment(const ModRelocationEntry& a, const ModRelocationEntry& b)
+{
+    return a.targetSegment < b.targetSegment;
+}
+
+static void storeAddress(byte* addressToWrite, uintptr_t valu)
+{
+    for (unsigned i = 0; i < sizeof(uintptr_t); i++)
+    {
+        addressToWrite[i] = (byte)(valu & 255);
+        valu >>= 8;
+    }
 }
 
 // This is called by the initial thread to actually do the export.
@@ -1672,6 +1726,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
 {
     PolyObject* copiedRoot = 0;
     CopyScan copyScan;
+    copyScan.singleImmutableArea = true;
 
     // Set the dependencies.  These are included first since the caller may have provided names.
     copyScan.dependencies[exportSignature] = true; // Always include the executable
@@ -1825,6 +1880,8 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             thisDescr.segmentIndex = entry->mtIndex;
             thisDescr.segmentSize = entry->mtLength; // Set this even if we don't write it.
             thisDescr.moduleIden = entry->mtModId;
+            if (j < newAreas)
+                thisDescr.originalAddr = (uintptr_t)entry->mtOriginalAddr;
             if (entry->mtFlags & MTF_WRITEABLE)
             {
                 thisDescr.segmentFlags |= MSF_WRITABLE;
@@ -1844,37 +1901,72 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
             throw IOException();
 
-        // Write out the relocations and the data.
-        for (unsigned k = 0; k < this->memTableEntries; k++)
+        // Write out the data and the relocations.
+        unsigned immutableSegments = 0;
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
+            if (this->memTable[k].mtFlags == 0) immutableSegments++;
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
         {
+            bool prelink = immutableSegments == 1 && this->memTable[k].mtFlags == 0;
             ModuleSegmentDescr* thisDescr = &descrs[k];
             ExportMemTable* entry = &this->memTable[k];
-            if (k >= newAreas) // Not permanent areas
+            // Create the relocation table.
+            this->relocationCount = 0;
+            this->relocations.clear();
+            char* start = (char*)entry->mtOriginalAddr;
+            char* end = start + entry->mtLength;
+            for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
             {
-                thisDescr->relocations = ftell(this->exportFile);
-                // Have to write this out.
-                this->relocationCount = 0;
-                // Create the relocation table.
-                char* start = (char*)entry->mtOriginalAddr;
-                char* end = start + entry->mtLength;
-                for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+                p++;
+                PolyObject* obj = (PolyObject*)p;
+                POLYUNSIGNED length = obj->Length();
+                // For saved states we don't include explicit relocations except
+                // in code but it's easier if we do for modules.
+                if (length != 0 && obj->IsCodeObject())
+                    machineDependent->ScanConstantsWithinCode(obj, this);
+                relocateObject(obj);
+                p += length;
+            }
+            std::stable_sort(this->relocations.begin(), this->relocations.end(), lessTargetSegment);
+            std::vector<ModRelocationRun> runs;
+            for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
+            {
+                if (runs.empty() || runs.back().targetSegment != r->targetSegment)
                 {
-                    p++;
-                    PolyObject* obj = (PolyObject*)p;
-                    POLYUNSIGNED length = obj->Length();
-                    // For saved states we don't include explicit relocations except
-                    // in code but it's easier if we do for modules.
-                    if (length != 0 && obj->IsCodeObject())
-                        machineDependent->ScanConstantsWithinCode(obj, this);
-                    relocateObject(obj);
-                    p += length;
+                    ModRelocationRun run = { r->targetSegment, 0 };
+                    runs.push_back(run);
                 }
-                thisDescr->relocationCount = this->relocationCount;
-                // Write out the data.
-                thisDescr->segmentData = ftell(exportFile);
-                if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
+                runs.back().count++;
+                if (r->relKind != PROCESS_RELOC_DIRECT)
+                    prelink = false;
+            }
+            thisDescr->relocationCount = this->relocationCount;
+            thisDescr->relocRunCount = (unsigned)runs.size();
+            // Write out the data.  A prelinked segment is written with its pointers set for
+            // it at its prelink address and the other segments where they are now.
+            thisDescr->segmentData = ftell(exportFile);
+            if (prelink)
+            {
+                uintptr_t prelinkAddr = ModulePrelinkAddress(exportModId, (uint64_t)thisDescr->segmentData);
+                std::vector<byte> staging((byte*)start, (byte*)end);
+                for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
+                {
+                    uintptr_t base = r->targetSegment == k ? prelinkAddr : (uintptr_t)this->memTable[r->targetSegment].mtOriginalAddr;
+                    storeAddress(staging.data() + r->relocAddress, base + r->targetAddress);
+                }
+                thisDescr->originalAddr = prelinkAddr;
+                if (!checkedFwrite(staging.data(), entry->mtLength, 1))
                     throw IOException();
             }
+            else if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
+                throw IOException();
+            thisDescr->relocations = ftell(this->exportFile);
+            if (!runs.empty() && !checkedFwrite(runs.data(), sizeof(ModRelocationRun), runs.size()))
+                throw IOException();
+            if (!this->relocations.empty() &&
+                    !checkedFwrite(this->relocations.data(), sizeof(ModRelocationEntry), this->relocations.size()))
+                throw IOException();
+            this->relocations.clear();
         }
         // Write the string table and construct the dependency table at the same time
         std::vector<ModDependencyEntry> dependencyTable;
@@ -1927,6 +2019,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
             loadMod.modDependencies.push_back(i->modId);
         loadedModules.push_back(loadMod);
+        loadedModuleIds.insert(ModuleKey(exportModId));
 
         // If it all succeeded we can switch over to the permanent spaces.
         if (gMem.PromoteNewExportSpaces(exportModId))
@@ -1949,6 +2042,19 @@ void ModuleExporter::Perform()
     try {
 #if (defined(_WIN32) && defined(UNICODE))
         exportFile = _wfopen(fileName, L"wb");
+#elif defined(POLYML_MAP_SAVED_STATES)
+        {
+            // Other processes may have the existing file mapped: write a new file rather
+            // than truncating theirs, which would raise SIGBUS in them.
+            char *existing = realpath(fileName, NULL);
+            if (existing != NULL)
+            {
+                unlink(existing);
+                exportFile = fopen(existing, "wb");
+                free(existing);
+            }
+            else exportFile = fopen(fileName, "wb");
+        }
 #else
         exportFile = fopen(fileName, "wb");
 #endif
@@ -2090,11 +2196,13 @@ public:
 // Data needed for relocation during load.
 class ModuleLoadData {
 public:
-    ModuleLoadData() : relocations(0), relocationCount(0), targetAddr(0) {}
+    ModuleLoadData() : relocations(0), relocationCount(0), relocRunCount(0), targetAddr(0), moved(true) {}
 
     off_t       relocations;        // Copied from descriptor
     unsigned    relocationCount;
+    unsigned    relocRunCount;
     PolyWord* targetAddr;           // Actual address of the segment
+    bool        moved;              // Not at the descriptor's originalAddr
 };
 
 void ModuleLoader::Perform()
@@ -2128,13 +2236,10 @@ void ModuleLoader::Perform()
             return;
         }
         // Check to see if this is already loaded
-        for (std::vector<LoadedModuleData>::iterator i = loadedModules.begin(); i < loadedModules.end(); i++)
+        if (loadedModuleIds.count(ModuleKey(header.thisModuleId)) != 0)
         {
-            if (i->modId == header.thisModuleId)
-            {
-                errorResult = "A module with this signature is already loaded";
-                return;
-            }
+            errorResult = "A module with this signature is already loaded";
+            return;
         }
         if (ModuleId(header.executableModId) != exportSignature)
         {
@@ -2192,6 +2297,14 @@ void ModuleLoader::Perform()
         std::vector<ModuleLoadData> loadData;
         loadData.reserve(header.segmentDescrCount);
 
+#ifdef POLYML_MAP_SAVED_STATES
+        // Only a segment wholly within the file is mapped: a page past the end of a truncated
+        // file would raise SIGBUS when touched.  The read path below reports the short read.
+        struct stat fileStat;
+        uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
+#endif
+        PermanentMemSpace* mappedSpace = 0;
+
         // Read in and create the new segments first.  If we have problems,
         // in particular if we have run out of memory, then it's easier to recover.
         for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
@@ -2199,6 +2312,7 @@ void ModuleLoader::Perform()
             MemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleIden);
             ModuleLoadData load;
             load.relocationCount = descr->relocationCount;
+            load.relocRunCount = descr->relocRunCount;
             load.relocations = descr->relocations;
 
             if (descr->segmentData == 0)
@@ -2209,6 +2323,7 @@ void ModuleLoader::Perform()
                     return;
                 }
                 load.targetAddr = space->bottom;
+                load.moved = (uintptr_t)space->bottom != descr->originalAddr;
             }
             else
             { // New segment.
@@ -2223,35 +2338,56 @@ void ModuleLoader::Perform()
                     (descr->segmentFlags & MSF_NOOVERWRITE ? MTF_NO_OVERWRITE : 0) |
                     (descr->segmentFlags & MSF_BYTES ? MTF_BYTES : 0) |
                     (descr->segmentFlags & MSF_CODE ? MTF_EXECUTABLE : 0);
-                // TODO: This creates the new space as though it existed in the original executable.
-                // We need to distinguish it somehow so we know which module it came from.
-                PermanentMemSpace* newSpace =
-                    gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, header.thisModuleId);
+                PermanentMemSpace* newSpace = 0;
+#ifdef POLYML_MAP_SAVED_STATES
+                // Map a prelinked segment where it was prelinked for.  If that address is
+                // taken, read it in instead and apply all its relocations.  Relocations in it
+                // to the module's other segments, which are read in, are applied below.
+                if (descr->originalAddr != 0 && descr->segmentFlags == 0 &&
+                        descr->segmentSize <= fileSize && (uint64_t)descr->segmentData <= fileSize - descr->segmentSize)
+                {
+                    newSpace = gMem.MapPermanentSpace((void*)descr->originalAddr, descr->segmentSize,
+                        fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, header.thisModuleId);
+                    if (newSpace != 0)
+                    {
+                        mappedSpace = newSpace;
+                        load.moved = false;
+                    }
+                }
+#endif
                 if (newSpace == 0)
                 {
-                    errorResult = "Unable to allocate memory";
-                    return;
-                }
-                if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
-                {
-                    errorResult = "Unable to seek to segment";
-                    return;
-                }
-                if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
-                {
-                    errorResult = "Unable to read segment";
-                    return;
-                }
-                if (newSpace->isMutable && (descr->segmentFlags & MSF_BYTES) != 0)
-                {
-                    ClearVolatile cwbr;
-                    cwbr.ScanAddressesInRegion(newSpace->bottom, (PolyWord*)((byte*)newSpace->bottom + descr->segmentSize));
+                    // TODO: This creates the new space as though it existed in the original executable.
+                    // We need to distinguish it somehow so we know which module it came from.
+                    newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, header.thisModuleId);
+                    if (newSpace == 0)
+                    {
+                        errorResult = "Unable to allocate memory";
+                        return;
+                    }
+                    if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
+                    {
+                        errorResult = "Unable to seek to segment";
+                        return;
+                    }
+                    if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
+                    {
+                        errorResult = "Unable to read segment";
+                        return;
+                    }
+                    if (newSpace->isMutable && (descr->segmentFlags & MSF_BYTES) != 0)
+                    {
+                        ClearVolatile cwbr;
+                        cwbr.ScanAddressesInRegion(newSpace->bottom, (PolyWord*)((byte*)newSpace->bottom + descr->segmentSize));
+                    }
                 }
                 load.targetAddr = newSpace->bottom;
             }
             loadData.push_back(load);
         }
-        // Now deal with relocation.
+        // Now deal with relocation.  A relocation sets a location to an address in a target
+        // segment.  The data in the file already holds that value unless the segment it is
+        // in or the target segment is not where the descriptors say.
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
         {
             PolyWord* baseAddr = i->targetAddr;
@@ -2261,20 +2397,42 @@ void ModuleLoader::Perform()
             // everything in an unstable state.
             if (i->relocations)
             {
-                if (fseek(loadFile, i->relocations, SEEK_SET) != 0)
-                    errorResult = "Unable to read relocation segment";
-                for (unsigned k = 0; k < i->relocationCount; k++)
+                std::vector<ModRelocationRun> runs(i->relocRunCount);
+                if (fseek(loadFile, i->relocations, SEEK_SET) != 0 ||
+                        (!runs.empty() && fread(runs.data(), sizeof(ModRelocationRun), runs.size(), loadFile) != runs.size()))
                 {
-                    ModRelocationEntry reloc;
-                    if (fread(&reloc, sizeof(reloc), 1, loadFile) != 1)
-                        errorResult = "Unable to read relocation segment";
-                    byte* setAddress = (byte*)baseAddr + reloc.relocAddress;
-                    ASSERT(reloc.targetSegment < header.segmentDescrCount);
-                    byte* targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
-                    ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                    errorResult = "Unable to read relocation segment";
+                    continue;
+                }
+                off_t runStart = i->relocations + (off_t)(runs.size() * sizeof(ModRelocationRun));
+                std::vector<ModRelocationEntry> relocs;
+                for (std::vector<ModRelocationRun>::iterator run = runs.begin(); run < runs.end(); run++)
+                {
+                    ASSERT(run->targetSegment < header.segmentDescrCount);
+                    if (i->moved || loadData[run->targetSegment].moved)
+                    {
+                        relocs.resize(run->count);
+                        if (fseek(loadFile, runStart, SEEK_SET) != 0 ||
+                                fread(relocs.data(), sizeof(ModRelocationEntry), run->count, loadFile) != run->count)
+                            errorResult = "Unable to read relocation segment";
+                        else
+                        {
+                            byte* targetBase = (byte*)loadData[run->targetSegment].targetAddr;
+                            for (std::vector<ModRelocationEntry>::iterator reloc = relocs.begin(); reloc < relocs.end(); reloc++)
+                            {
+                                byte* setAddress = (byte*)baseAddr + reloc->relocAddress;
+                                ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetBase + reloc->targetAddress), reloc->relKind);
+                            }
+                        }
+                    }
+                    runStart += (off_t)(run->count * sizeof(ModRelocationEntry));
                 }
             }
         }
+#ifdef POLYML_MAP_SAVED_STATES
+        if (mappedSpace != 0)
+            gMem.WriteProtectMappedSpace(mappedSpace);
+#endif
 
         // Get the root address.  Push this to the caller's save vec.  If we put the
         // newly created areas into local memory we could get a GC as soon as we
@@ -2288,6 +2446,7 @@ void ModuleLoader::Perform()
 
         // Now add the entry to the loaded module table
         loadedModules.push_back(loadMod);
+        loadedModuleIds.insert(ModuleKey(header.thisModuleId));
     }
     catch (const std::bad_alloc&)
     {
@@ -2557,6 +2716,7 @@ void ModuleReleaser::Perform()
             else mod++;
         }
         loadedModules.erase(mod);
+        loadedModuleIds.erase(ModuleKey(moduleId));
         if (!gMem.DemoteOldPermanentSpaces(moduleId))
             errorMessage = "Insufficient Memory";
     }

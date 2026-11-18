@@ -445,7 +445,10 @@ void *OSMemUnrestricted::AllocateDataArea(size_t &space)
 // the segment.  The space must be the size actually allocated.
 bool OSMemUnrestricted::FreeDataArea(void *p, size_t space)
 {
-    return munmap(FIXTYPE p, space) == 0;
+    // A module segment mapped from its file need not start on a page boundary
+    // (MemMgr::MapPermanentSpace): release the pages that contain it.
+    uintptr_t delta = (uintptr_t)p % pageSize;
+    return munmap(FIXTYPE ((char*)p - delta), space + delta) == 0;
 }
 
 bool OSMemUnrestricted::EnableWrite(bool enable, void* p, size_t space)
