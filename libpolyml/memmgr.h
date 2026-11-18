@@ -26,6 +26,7 @@
 #include "osmem.h"
 #include "../polyexports.h" // For struct _moduleId
 #include <vector>
+#include <unordered_map>
 
 // Saved-state data segments are allocated in a fixed address region when saving and are
 // mapped from the file at those addresses when loading, so unwritten pages stay shared
@@ -159,7 +160,7 @@ class PermanentMemSpace: public MemSpace
 {
 protected:
     PermanentMemSpace(OSMem *alloc): MemSpace(alloc), index(0), isWriteProtected(false), noOverwrite(false),
-        byteOnly(false), constArea(false), topPointer(0) {
+        byteOnly(false), constArea(false), topPointer(0), copyGraves(0) {
     }
 
 public:
@@ -175,6 +176,8 @@ public:
 
     Bitmap      shareBitmap; // Used in sharedata
     Bitmap      profileCode; // Used when profiling
+    // While CopyScan runs: where the tombstones for this write-protected space are, if any.
+    PolyWord    *copyGraves;
 
     ModuleId    moduleIdentifier; // The identifier of the source module, usually the executable itself.
 
@@ -296,8 +299,11 @@ public:
 #ifdef POLYML_MAP_SAVED_STATES
     // Create a permanent space by mapping byteSize bytes of file fd at offset, privately and
     // copy-on-write, at exactly addr.  Returns 0, mapping nothing, if that address isn't free.
+    // addr need not be page-aligned if offset is congruent to it modulo the page size: the
+    // pages containing the segment are mapped and are released with the space.
     PermanentMemSpace *MapPermanentSpace(void *addr, uintptr_t byteSize, int fd, uint64_t offset,
         unsigned flags, unsigned index, ModuleId sourceModule);
+    void WriteProtectMappedSpace(PermanentMemSpace *space);
 #endif
 
     // Delete a local space.  Takes the iterator position in lSpaces and returns the
@@ -347,6 +353,22 @@ public:
 #endif
 
     PermanentMemSpace *SpaceForIndex(unsigned index, ModuleId modId); // Return the space for a given index
+private:
+    // Index of pSpaces by (module, index), kept in step with pSpaces, for SpaceForIndex.
+    struct SpaceKey {
+        uint32_t modA, modB; unsigned index;
+        bool operator==(const SpaceKey &k) const { return modA == k.modA && modB == k.modB && index == k.index; }
+    };
+    struct SpaceKeyHash {
+        size_t operator()(const SpaceKey &k) const
+        { return (size_t)(((uint64_t)k.modA << 32 | k.modB) * 0x9E3779B97F4A7C15ull) ^ k.index; }
+    };
+    std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash> spaceIndex;
+    static SpaceKey KeyFor(PermanentMemSpace *space)
+    { struct _moduleId m = space->moduleIdentifier; SpaceKey k = { m.modA, m.modB, space->index }; return k; }
+    void AddPermanentSpace(PermanentMemSpace *space);
+    void RemoveFromSpaceIndex(PermanentMemSpace *space);
+public:
 
     // As a debugging check, write protect the immutable areas apart from during the GC.
     void ProtectImmutable(bool on);

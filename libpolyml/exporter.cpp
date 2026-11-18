@@ -140,6 +140,7 @@ CopyScan::CopyScan(bool isExp /*=false*/)
     defaultImmSize = defaultMutSize = defaultCodeSize = defaultNoOverSize = 0;
     tombs = 0;
     graveYard = 0;
+    singleImmutableArea = false;
     hash_a = hash_b = hash_c = 0xdeadbeef;
 
     // Add extra randomness to the hash values.  This is still reproducible if SOURCE_DATE_EPOCH is set.
@@ -160,16 +161,9 @@ void CopyScan::initialise()
     // want to use a smaller size because they are retained after we save
     // the state and if we have many child saved states it's important not
     // to waste memory.
-    if (isExport)
-    {
-        graveYard = new GraveYard[gMem.pSpaces.size()];
-        if (graveYard == 0)
-        {
-            if (debugOptions & DEBUG_SAVING)
-                Log("SAVE: Unable to allocate graveyard, size: %lu.\n", gMem.pSpaces.size());
-            throw MemoryException();
-        }
-    }
+    // Write-protected permanent spaces need a graveyard when saving a state or a module too:
+    // module segments mapped from their files are write-protected.
+    graveYard = new GraveYard[gMem.pSpaces.size()];
 
     for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
     {
@@ -202,6 +196,8 @@ void CopyScan::initialise()
                         graveYard[tombs].graves, space->spaceSize() * sizeof(PolyWord));
                 graveYard[tombs].startAddr = space->bottom;
                 graveYard[tombs].endAddr = space->top;
+                graveYard[tombs].space = space;
+                space->copyGraves = graveYard[tombs].graves;
                 tombs++;
             }
         }
@@ -245,6 +241,19 @@ void CopyScan::initialise()
 #endif
         if (defaultNoOverSize < 4096) defaultNoOverSize = 4096; // Except for the no-overwrite area
     }
+    else if (singleImmutableArea)
+    {
+        // A module whose immutable data fits one segment can be mapped from its file:
+        // allow that segment to be large (8MB to 512MB).
+        if (defaultMutSize < 1024) defaultMutSize = 1024;
+        if (defaultImmSize < 1024 * 1024) defaultImmSize = 1024 * 1024;
+        if (defaultCodeSize < 4096) defaultCodeSize = 4096;
+        if (defaultNoOverSize < 4096) defaultNoOverSize = 4096;
+        if (defaultMutSize > 1024 * 1024) defaultMutSize = 1024 * 1024;
+        if (defaultImmSize > 64 * 1024 * 1024) defaultImmSize = 64 * 1024 * 1024;
+        if (defaultCodeSize > 1024 * 1024) defaultCodeSize = 1024 * 1024;
+        if (defaultNoOverSize > 1024 * 1024) defaultNoOverSize = 1024 * 1024;
+    }
     else
     {
         // Much smaller minimum sizes for saved states.
@@ -267,6 +276,8 @@ void CopyScan::initialise()
 CopyScan::~CopyScan()
 {
     gMem.DeleteExportSpaces();
+    for (unsigned i = 0; i < tombs; i++)
+        graveYard[i].space->copyGraves = 0;
     if (graveYard)
         delete[](graveYard);
 }
@@ -329,27 +340,23 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
     else if (space->spaceType == ST_PERMANENT)
     {
         // See if we have this in the grave-yard.
-        for (unsigned i = 0; i < tombs; i++)
+        PermanentMemSpace *pmSpace = (PermanentMemSpace*)space;
+        if (pmSpace->copyGraves != 0)
         {
-            GraveYard *g = &graveYard[i];
-            if ((PolyWord*)obj >= g->startAddr && (PolyWord*)obj < g->endAddr)
+            PolyWord *tombAddr = pmSpace->copyGraves + ((PolyWord*)obj - pmSpace->bottom);
+            PolyObject *tombObject = (PolyObject*)tombAddr;
+            if (tombObject->ContainsForwardingPtr())
             {
-                PolyWord *tombAddr = g->graves + ((PolyWord*)obj - g->startAddr);
-                PolyObject *tombObject = (PolyObject*)tombAddr;
-                if (tombObject->ContainsForwardingPtr())
-                {
 #ifdef POLYML32IN64
-                    PolyObject *newAddr;
-                    if (space->isCode)
-                        newAddr = (PolyObject*)(globalCodeBase + ((tombObject->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
-                    else newAddr = tombObject->GetForwardingPtr();
+                PolyObject *newAddr;
+                if (space->isCode)
+                    newAddr = (PolyObject*)(globalCodeBase + ((tombObject->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
+                else newAddr = tombObject->GetForwardingPtr();
 #else
-                    PolyObject *newAddr = tombObject->GetForwardingPtr();
+                PolyObject *newAddr = tombObject->GetForwardingPtr();
 #endif
-                    *pt = newAddr;
-                    return 0;
-                }
-                break; // No need to look further
+                *pt = newAddr;
+                return 0;
             }
         }
     }
@@ -367,7 +374,7 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
         if (obj->IsNoOverwriteObject()) naType = NANoOverwriteMutable; else naType = NAMutable;
     }
     else if (obj->IsCodeObject()) naType = NACode;
-    else if (obj->IsByteObject()) naType = NAByte;
+    else if (obj->IsByteObject() && !singleImmutableArea) naType = NAByte;
     else naType = NAWord;
     PolyObject* newObj;
 #if((defined(HOSTARCHITECTURE_X86_64) || defined(HOSTARCHITECTURE_AARCH64)) && ! defined(POLYML32IN64) && !defined(CODEISNOTEXECUTABLE) && !defined(_WIN32))
@@ -424,28 +431,20 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
     if (space->spaceType == ST_PERMANENT && ((PermanentMemSpace*)space)->isWriteProtected)
     {
         // The immutable permanent areas are read-only.
-        unsigned m;
-        for (m = 0; m < tombs; m++)
-        {
-            GraveYard *g = &graveYard[m];
-            if ((PolyWord*)obj >= g->startAddr && (PolyWord*)obj < g->endAddr)
-            {
-                PolyWord *tombAddr = g->graves + ((PolyWord*)obj - g->startAddr);
-                PolyObject *tombObject = (PolyObject*)tombAddr;
+        PermanentMemSpace *pmSpace = (PermanentMemSpace*)space;
+        ASSERT(pmSpace->copyGraves != 0); // Should be there.
+        PolyWord *tombAddr = pmSpace->copyGraves + ((PolyWord*)obj - pmSpace->bottom);
+        PolyObject *tombObject = (PolyObject*)tombAddr;
 #ifdef POLYML32IN64
-                if (naType == NACode)
-                {
-                    POLYUNSIGNED ll = (POLYUNSIGNED)(((PolyWord*)newObj - globalCodeBase) >> 1 | _OBJ_TOMBSTONE_BIT);
-                    tombObject->SetLengthWord(ll);
-                }
-                else tombObject->SetForwardingPtr(newObj);
-#else
-                tombObject->SetForwardingPtr(newObj);
-#endif
-                break; // No need to look further
-            }
+        if (naType == NACode)
+        {
+            POLYUNSIGNED ll = (POLYUNSIGNED)(((PolyWord*)newObj - globalCodeBase) >> 1 | _OBJ_TOMBSTONE_BIT);
+            tombObject->SetLengthWord(ll);
         }
-        ASSERT(m < tombs); // Should be there.
+        else tombObject->SetForwardingPtr(newObj);
+#else
+        tombObject->SetForwardingPtr(newObj);
+#endif
     }
     else if (naType == NACode)
 #ifdef POLYML32IN64
@@ -1126,7 +1125,10 @@ void CopyScan::fixPermanentAreas()
 {
     for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
     {
-        MemSpace* space = *i;
+        PermanentMemSpace* space = *i;
+        // Objects in write-protected areas are never forwarded: their tombstones are in the graveyard.
+        if (space->isWriteProtected)
+            continue;
         // Permanent areas are filled with objects from the bottom.
         FixForwarding(space->bottom, space->top - space->bottom);
     }
