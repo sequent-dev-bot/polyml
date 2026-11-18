@@ -90,6 +90,13 @@ protected:
     unsigned memTableEntries;
     PolyObject *rootFunction; // Address of the root function.
     ModuleId exportModId;
+
+private:
+    // The memTable entries sorted by start address, for findArea.  A state that
+    // depends on thousands of modules has an entry for each of their spaces.
+    std::vector<std::pair<char*, unsigned> > areasByAddress;
+    ExportMemTable *areasIndexedTable;
+    unsigned areasIndexedCount;
 };
 
 // The object-code exporters all use a similar string table format
