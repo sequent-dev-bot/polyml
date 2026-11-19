@@ -755,6 +755,18 @@ void SaveRequest::Perform()
 
         memTableEntries = memTableCount;
 
+        // Once the locals are switched, the export spaces must become permanent, so
+        // reserve what that needs first.  Until then the copy can still be undone.
+        if (!gMem.ReserveForPromotion())
+        {
+            CopyScan::revertToLocal();
+            errorMessage = "Out of Memory";
+            errNumber = NOMEMORY;
+            if (debugOptions & DEBUG_SAVING)
+                Log("SAVE: Unable to reserve space to promote export spaces.\n");
+            return;
+        }
+
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Updating references to moved objects.\n");
         // We always switch to the permanent space even if there's been a
@@ -3254,10 +3266,15 @@ void ModuleReleaser::Perform()
                 }
             }
         }
+        // The module stays registered until all its spaces are demoted, so a
+        // failed release can be retried.
+        if (!gMem.DemoteOldPermanentSpaces(moduleId))
+        {
+            errorMessage = "Insufficient Memory";
+            return;
+        }
         loadedModules.erase(mod);
         loadedModuleIds.erase(ModuleKey(moduleId));
-        if (!gMem.DemoteOldPermanentSpaces(moduleId))
-            errorMessage = "Insufficient Memory";
     }
     catch (const std::bad_alloc&)
     {

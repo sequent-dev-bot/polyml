@@ -30,8 +30,9 @@
 
 // Saved-state data segments are allocated in a fixed address region when saving and are
 // mapped from the file at those addresses when loading, so unwritten pages stay shared
-// between processes that load the same file.  Linux, native addresses only.
-#if (defined(__linux__) && !defined(POLYML32IN64))
+// between processes that load the same file.  64-bit Linux, native addresses only: the
+// region's addresses don't fit in 32 bits.
+#if (defined(__linux__) && defined(__LP64__) && !defined(POLYML32IN64))
 #define POLYML_MAP_SAVED_STATES 1
 #endif
 
@@ -350,6 +351,8 @@ public:
     PermanentMemSpace *NewExportSpace(uintptr_t size, bool mut, bool noOv, bool code);
     void DeleteExportSpaces(void);
     bool PromoteNewExportSpaces(ModuleId newModId); // Turn export spaces into permanent spaces.
+    // Reserve what PromoteNewExportSpaces needs, so that it cannot then fail.
+    bool ReserveForPromotion();
     bool DemoteOldPermanentSpaces(ModuleId modId); // Turn any old permanent spaces with this ID into local spaces.
     void DeletePermanentSpaces(ModuleId modId); // Remove and free the spaces a failed module load added.
 #ifdef POLYML_MAP_SAVED_STATES
@@ -370,6 +373,8 @@ private:
         { return (size_t)(((uint64_t)k.modA << 32 | k.modB) * 0x9E3779B97F4A7C15ull) ^ k.index; }
     };
     std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash> spaceIndex;
+    // False once an update of spaceIndex has failed: SpaceForIndex then searches pSpaces.
+    bool spaceIndexComplete;
     static SpaceKey KeyFor(PermanentMemSpace *space)
     { struct _moduleId m = space->moduleIdentifier; SpaceKey k = { m.modA, m.modB, space->index }; return k; }
     void AddPermanentSpace(PermanentMemSpace *space);

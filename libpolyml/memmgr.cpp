@@ -144,6 +144,7 @@ bool LocalMemSpace::InitSpace(PolyWord *heapSpace, uintptr_t size, bool mut)
 MemMgr::MemMgr(): allocLock("Memmgr alloc"), codeBitmapLock("Code bitmap")
 {
     nextIndex = 0;
+    spaceIndexComplete = true;
 #ifdef POLYML_MAP_SAVED_STATES
     mappedFileData = false;
 #endif
@@ -753,6 +754,17 @@ void MemMgr::DeletePermanentSpaces(ModuleId modId)
 
 // Turn export spaces into permanent spaces.  Used for saved states and also for modules.
 // If that fails, nothing is changed.
+bool MemMgr::ReserveForPromotion()
+{
+    try {
+        pSpaces.reserve(pSpaces.size() + eSpaces.size());
+        return true;
+    }
+    catch (std::bad_alloc&) {
+        return false;
+    }
+}
+
 bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
 {
     size_t oldCount = pSpaces.size();
@@ -800,27 +812,38 @@ PermanentMemSpace *MemMgr::SpaceForIndex(unsigned index, ModuleId modId)
 {
     struct _moduleId m = modId;
     SpaceKey k = { m.modA, m.modB, index };
+    if (!spaceIndexComplete)
+    {
+        for (std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin(); i < pSpaces.end(); i++)
+        {
+            if (KeyFor(*i) == k) return *i;
+        }
+        return NULL;
+    }
     std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash>::iterator i = spaceIndex.find(k);
     return i == spaceIndex.end() ? NULL : i->second;
 }
 
 // Add a space to pSpaces and its index.  The index holds the first space with a key, as a
-// search of pSpaces in order would find.
+// search of pSpaces in order would find.  Only adding to pSpaces can fail: if the index
+// can't take the space, SpaceForIndex searches pSpaces from then on.
 void MemMgr::AddPermanentSpace(PermanentMemSpace *space)
 {
     pSpaces.push_back(space);
+    if (!spaceIndexComplete) return;
     try {
         spaceIndex.emplace(KeyFor(space), space);
     }
-    catch (...) {
-        pSpaces.pop_back();
-        throw;
+    catch (std::bad_alloc&) {
+        spaceIndexComplete = false;
+        spaceIndex.clear();
     }
 }
 
 // Called before a space is removed from pSpaces.
 void MemMgr::RemoveFromSpaceIndex(PermanentMemSpace *space)
 {
+    if (!spaceIndexComplete) return;
     SpaceKey k = KeyFor(space);
     std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash>::iterator f = spaceIndex.find(k);
     if (f == spaceIndex.end() || f->second != space)
@@ -830,7 +853,13 @@ void MemMgr::RemoveFromSpaceIndex(PermanentMemSpace *space)
     {
         if (*i != space && KeyFor(*i) == k)
         {
-            spaceIndex.emplace(k, *i);
+            try {
+                spaceIndex.emplace(k, *i);
+            }
+            catch (std::bad_alloc&) {
+                spaceIndexComplete = false;
+                spaceIndex.clear();
+            }
             break;
         }
     }
