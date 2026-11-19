@@ -2679,8 +2679,12 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         std::unordered_set<uintptr_t> patched;
         // Now deal with relocation.  A relocation sets a location to an address in a target
         // segment.  The data in the file already holds that value unless the segment it is
-        // in or the target segment is not where the descriptors say.
+        // in or the target segment is not where the descriptors say.  When no segment
+        // moved there is nothing to set, so the relocation tables are not read.
+        bool anyMoved = false;
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
+            anyMoved = anyMoved || i->moved;
+        for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); anyMoved && i < loadData.end(); i++)
         {
             PolyWord* baseAddr = i->targetAddr;
             ASSERT(baseAddr != NULL); // We should have created it.
