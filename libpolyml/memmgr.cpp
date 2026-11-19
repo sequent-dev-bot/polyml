@@ -292,31 +292,37 @@ bool MemMgr::AddLocalSpace(LocalMemSpace *space)
     // Update the B-tree.
     try {
         AddTree(space);
-        // The entries in the local table are ordered so that the copy phase of the full
-        // GC simply has to copy to an entry earlier in the table.  Immutable spaces come
-        // first, followed by mutable spaces and finally allocation spaces.
-        if (space->allocationSpace)
-            lSpaces.push_back(space); // Just add at the end
-        else if (space->isMutable)
-        {
-            // Add before the allocation spaces
-            std::vector<LocalMemSpace*>::iterator i = lSpaces.begin();
-            while (i != lSpaces.end() && ! (*i)->allocationSpace) i++;
-            lSpaces.insert(i, space);
-        }
-        else
-        {
-            // Immutable space: Add before the mutable spaces
-            std::vector<LocalMemSpace*>::iterator i = lSpaces.begin();
-            while (i != lSpaces.end() && ! (*i)->isMutable) i++;
-            lSpaces.insert(i, space);
-        }
+        InsertLocalSpace(space);
     }
     catch (std::bad_alloc&) {
         RemoveTree(space);
         return false;
     }
     return true;
+}
+
+// Add a local space to lSpaces.  Allocates only if lSpaces has no spare capacity.
+void MemMgr::InsertLocalSpace(LocalMemSpace *space)
+{
+    // The entries in the local table are ordered so that the copy phase of the full
+    // GC simply has to copy to an entry earlier in the table.  Immutable spaces come
+    // first, followed by mutable spaces and finally allocation spaces.
+    if (space->allocationSpace)
+        lSpaces.push_back(space); // Just add at the end
+    else if (space->isMutable)
+    {
+        // Add before the allocation spaces
+        std::vector<LocalMemSpace*>::iterator i = lSpaces.begin();
+        while (i != lSpaces.end() && ! (*i)->allocationSpace) i++;
+        lSpaces.insert(i, space);
+    }
+    else
+    {
+        // Immutable space: Add before the mutable spaces
+        std::vector<LocalMemSpace*>::iterator i = lSpaces.begin();
+        while (i != lSpaces.end() && ! (*i)->isMutable) i++;
+        lSpaces.insert(i, space);
+    }
 }
 
 // Create an entry for a permanent space that already exists in the executable.
@@ -619,135 +625,155 @@ void MemMgr::DeleteExportSpaces(void)
     eSpaces.clear();
 }
 
+static bool SmallerCodeSpace(const CodeSpace *left, const CodeSpace *right);
+
 // If we have saved the state rather than exported a function we turn the exported
 // spaces into permanent ones, removing existing permanent spaces at the same or
 // lower level.
+// Every space with the id is converted, or none is: in a module demoted in part, the
+// remaining permanent spaces could point into converted ones, and the GC doesn't scan
+// immutable permanent spaces for pointers.  So everything that can fail is done first,
+// and the conversion itself can't fail.
 bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
 {
     // Save permanent spaces at a lower hierarchy.  Others are converted into
     // local spaces.  Most or all items will have been copied from these spaces
     // into an export space but there could be items reachable only from the stack.
-    std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin();
-    while (i != pSpaces.end())
-    {
-        PermanentMemSpace* pSpace = *i;
-        if (pSpace->moduleIdentifier != modId)
-            i++;
-        else
+    std::vector<PermanentMemSpace*> old;
+    std::vector<MemSpace*> replacement;
+    size_t codeSpaces = 0, localSpaces = 0;
+    bool prepared = true;
+    try {
+        for (std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin(); i != pSpaces.end(); i++)
+            if ((*i)->moduleIdentifier == modId)
+                old.push_back(*i);
+        replacement.reserve(old.size());
+        for (std::vector<PermanentMemSpace*>::iterator i = old.begin(); prepared && i != old.end(); i++)
         {
-            try {
+            PermanentMemSpace* pSpace = *i;
 #ifdef POLYML_MAP_SAVED_STATES
-                // A module segment mapped from its file is write-protected once relocated.
-                // Make it writable first, so that the space is left as it was if that fails.
-                if (pSpace->isWriteProtected && !pSpace->isCode)
+            // A module segment mapped from its file is write-protected once relocated.
+            if (pSpace->isWriteProtected && !pSpace->isCode)
+            {
+                uintptr_t delta = (uintptr_t)pSpace->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
+                if (mprotect((char*)pSpace->bottom - delta, (char*)pSpace->top - (char*)pSpace->bottom + delta,
+                        PROT_READ|PROT_WRITE) != 0)
                 {
-                    uintptr_t delta = (uintptr_t)pSpace->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
-                    if (mprotect((char*)pSpace->bottom - delta, (char*)pSpace->top - (char*)pSpace->bottom + delta,
-                            PROT_READ|PROT_WRITE) != 0)
-                        return false;
-                    pSpace->isWriteProtected = false;
+                    prepared = false;
+                    break;
                 }
-#endif
-                // Turn this into a local space or a code space.  The new space replaces this
-                // one in the tree; if adding it fails this one goes back, so a failure leaves
-                // the space as it was.
-
-                if (pSpace->isCode)
-                {
-                    // Enable write access.  Permanent spaces are read-only.
- //                   osCodeAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
- //                       PERMISSION_READ | PERMISSION_WRITE | PERMISSION_EXEC);
-                    CodeSpace* space = new CodeSpace(pSpace->bottom, pSpace->shadowSpace, pSpace->spaceSize(), &osCodeAlloc);
-                    if (!space->headerMap.Create(space->spaceSize()))
-                    {
-                        if (debugOptions & DEBUG_MEMMGR)
-                            Log("MMGR: Unable to create header map for state space %p\n", pSpace);
-                        space->bottom = 0; // The memory is still the permanent space's.
-                        delete space;
-                        return false;
-                    }
-                    RemoveTree(pSpace);
-                    if (!AddCodeSpace(space))
-                    {
-                        if (debugOptions & DEBUG_MEMMGR)
-                            Log("MMGR: Unable to convert saved state space %p into code space\n", pSpace);
-                        space->bottom = 0; // The memory is still the permanent space's.
-                        delete space;
-                        AddTree(pSpace);
-                        return false;
-                    }
-                    if (debugOptions & DEBUG_MEMMGR)
-                        Log("MMGR: Converted saved state space %p into code space %p\n", pSpace, space);
-                    // Set the bits in the header map.
-                    for (PolyWord* ptr = space->bottom; ptr < space->top; )
-                    {
-                        PolyObject* obj = (PolyObject*)(ptr + 1);
-                        // We may have forwarded this if this has been
-                        // copied to the exported area. Restore the original length word.
-                        if (obj->ContainsForwardingPtr())
-                        {
-#ifdef POLYML32IN64
-                            PolyObject* forwardedTo = obj;
-                            // This is relative to globalCodeBase not globalHeapBase
-                            while (forwardedTo->ContainsForwardingPtr())
-                                forwardedTo = (PolyObject*)(globalCodeBase + ((forwardedTo->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
-#else
-                            PolyObject* forwardedTo = obj->FollowForwardingChain();
-#endif
-                            obj->SetLengthWord(forwardedTo->LengthWord());
-                        }
-                        // Set the "start" bit if this is allocated.  It will be a byte seg if not.
-                        if (obj->IsCodeObject())
-                            space->headerMap.SetBit(ptr - space->bottom);
-                        ASSERT(!obj->IsClosureObject());
-                        ptr += obj->Length() + 1;
-                    }
-                }
-                else
-                {
-                    // Enable write access.  Permanent spaces are read-only.
-//                    osHeapAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
-//                        PERMISSION_READ | PERMISSION_WRITE);
-                    LocalMemSpace* space = new LocalMemSpace(&osHeapAlloc);
-                    space->top = pSpace->top;
-                    // Space is allocated in local areas from the top down.  This area is full and
-                    // all data is in the old generation.  The area can be recovered by a full GC.
-                    space->bottom = space->upperAllocPtr = space->lowerAllocPtr =
-                        space->fullGCLowerLimit = pSpace->bottom;
-                    space->isMutable = pSpace->isMutable;
-                    space->isCode = false;
-                    if (!space->bitmap.Create(space->top - space->bottom))
-                    {
-                        if (debugOptions & DEBUG_MEMMGR)
-                            Log("MMGR: Unable to convert saved state space %p into local space\n", pSpace);
-                        space->bottom = 0; // The memory is still the permanent space's.
-                        delete space;
-                        return false;
-                    }
-                    RemoveTree(pSpace);
-                    if (!AddLocalSpace(space))
-                    {
-                        if (debugOptions & DEBUG_MEMMGR)
-                            Log("MMGR: Unable to convert saved state space %p into local space\n", pSpace);
-                        space->bottom = 0; // The memory is still the permanent space's.
-                        delete space;
-                        AddTree(pSpace);
-                        return false;
-                    }
-
-                    if (debugOptions & DEBUG_MEMMGR)
-                        Log("MMGR: Converted saved state space %p into local %smutable space %p\n",
-                            pSpace, pSpace->isMutable ? "im" : "", space);
-                    currentHeapSize += space->spaceSize();
-                    globalStats.setSize(PSS_TOTAL_HEAP, currentHeapSize * sizeof(PolyWord));
-                }
-                RemoveFromSpaceIndex(pSpace);
-                i = pSpaces.erase(i);
+                pSpace->isWriteProtected = false;
             }
-            catch (std::bad_alloc&) {
-                return false;
+#endif
+            if (pSpace->isCode)
+            {
+                // Enable write access.  Permanent spaces are read-only.
+ //               osCodeAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
+ //                   PERMISSION_READ | PERMISSION_WRITE | PERMISSION_EXEC);
+                CodeSpace* space = new CodeSpace(pSpace->bottom, pSpace->shadowSpace, pSpace->spaceSize(), &osCodeAlloc);
+                replacement.push_back(space);
+                if (!space->headerMap.Create(space->spaceSize()))
+                {
+                    if (debugOptions & DEBUG_MEMMGR)
+                        Log("MMGR: Unable to create header map for state space %p\n", pSpace);
+                    prepared = false;
+                }
+                codeSpaces++;
+            }
+            else
+            {
+                // Enable write access.  Permanent spaces are read-only.
+//                osHeapAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
+//                    PERMISSION_READ | PERMISSION_WRITE);
+                LocalMemSpace* space = new LocalMemSpace(&osHeapAlloc);
+                replacement.push_back(space);
+                space->top = pSpace->top;
+                // Space is allocated in local areas from the top down.  This area is full and
+                // all data is in the old generation.  The area can be recovered by a full GC.
+                space->bottom = space->upperAllocPtr = space->lowerAllocPtr =
+                    space->fullGCLowerLimit = pSpace->bottom;
+                space->isMutable = pSpace->isMutable;
+                space->isCode = false;
+                if (!space->bitmap.Create(space->top - space->bottom))
+                {
+                    if (debugOptions & DEBUG_MEMMGR)
+                        Log("MMGR: Unable to convert saved state space %p into local space\n", pSpace);
+                    prepared = false;
+                }
+                localSpaces++;
             }
         }
+        if (prepared)
+        {
+            // The tables the new spaces go in have room for them.
+            lSpaces.reserve(lSpaces.size() + localSpaces);
+            cSpaces.reserve(cSpaces.size() + codeSpaces);
+            codeSpaceHeap.reserve(codeSpaceHeap.size() + codeSpaces);
+        }
+    }
+    catch (std::bad_alloc&) {
+        prepared = false;
+    }
+    if (!prepared)
+    {
+        for (std::vector<MemSpace*>::iterator r = replacement.begin(); r != replacement.end(); r++)
+        {
+            (*r)->bottom = 0; // The memory is still the permanent space's.
+            delete *r;
+        }
+        return false;
+    }
+
+    for (size_t k = 0; k < old.size(); k++)
+    {
+        PermanentMemSpace* pSpace = old[k];
+        // The new space takes this one's entries in the tree, so the tree allocates nothing.
+        ReplaceTree(pSpace, replacement[k]);
+        if (pSpace->isCode)
+        {
+            CodeSpace* space = (CodeSpace*)replacement[k];
+            cSpaces.push_back(space);
+            codeSpaceHeap.push_back(space);
+            std::push_heap(codeSpaceHeap.begin(), codeSpaceHeap.end(), SmallerCodeSpace);
+            if (debugOptions & DEBUG_MEMMGR)
+                Log("MMGR: Converted saved state space %p into code space %p\n", pSpace, space);
+            // Set the bits in the header map.
+            for (PolyWord* ptr = space->bottom; ptr < space->top; )
+            {
+                PolyObject* obj = (PolyObject*)(ptr + 1);
+                // We may have forwarded this if this has been
+                // copied to the exported area. Restore the original length word.
+                if (obj->ContainsForwardingPtr())
+                {
+#ifdef POLYML32IN64
+                    PolyObject* forwardedTo = obj;
+                    // This is relative to globalCodeBase not globalHeapBase
+                    while (forwardedTo->ContainsForwardingPtr())
+                        forwardedTo = (PolyObject*)(globalCodeBase + ((forwardedTo->LengthWord() & ~_OBJ_TOMBSTONE_BIT) << 1));
+#else
+                    PolyObject* forwardedTo = obj->FollowForwardingChain();
+#endif
+                    obj->SetLengthWord(forwardedTo->LengthWord());
+                }
+                // Set the "start" bit if this is allocated.  It will be a byte seg if not.
+                if (obj->IsCodeObject())
+                    space->headerMap.SetBit(ptr - space->bottom);
+                ASSERT(!obj->IsClosureObject());
+                ptr += obj->Length() + 1;
+            }
+        }
+        else
+        {
+            LocalMemSpace* space = (LocalMemSpace*)replacement[k];
+            InsertLocalSpace(space);
+            if (debugOptions & DEBUG_MEMMGR)
+                Log("MMGR: Converted saved state space %p into local %smutable space %p\n",
+                    pSpace, pSpace->isMutable ? "im" : "", space);
+            currentHeapSize += space->spaceSize();
+            globalStats.setSize(PSS_TOTAL_HEAP, currentHeapSize * sizeof(PolyWord));
+        }
+        RemoveFromSpaceIndex(pSpace);
+        pSpaces.erase(std::find(pSpaces.begin(), pSpaces.end(), pSpace));
     }
     return true;
 }
@@ -1504,6 +1530,41 @@ void MemMgr::RemoveTreeRange(SpaceTree **tt, MemSpace *space, uintptr_t startS, 
     }
     delete(t);
     *tt = 0;
+}
+
+// Make the tree entries of oldS name newS, which covers the same range.  Allocates nothing.
+void MemMgr::ReplaceTree(MemSpace *oldS, MemSpace *newS)
+{
+    PLocker lock(&spaceTreeLock);
+    ReplaceTreeRange(&spaceTree, oldS, newS, (uintptr_t)oldS->bottom, (uintptr_t)oldS->top);
+}
+
+void MemMgr::ReplaceTreeRange(SpaceTree **tt, MemSpace *oldS, MemSpace *newS, uintptr_t startS, uintptr_t endS)
+{
+    SpaceTreeTree *t = (SpaceTreeTree*)*tt;
+    ASSERT(t != 0 && ! t->isSpace);
+    const unsigned shift = (sizeof(void*)-1) * 8;
+    uintptr_t r = startS >> shift;
+    const uintptr_t s = endS == 0 ? 256 : endS >> shift;
+
+    if (r == s)
+        ReplaceTreeRange(&(t->tree[r]), oldS, newS, startS << 8, endS << 8);
+    else
+    {
+        if ((r << shift) != startS)
+        {
+            ReplaceTreeRange(&(t->tree[r]), oldS, newS, startS << 8, 0);
+            r++;
+        }
+        while (r < s)
+        {
+            ASSERT(t->tree[r] == oldS);
+            t->tree[r] = newS;
+            r++;
+        }
+        if ((s << shift) != endS)
+            ReplaceTreeRange(&(t->tree[r]), oldS, newS, 0, endS << 8);
+    }
 }
 
 uintptr_t MemMgr::AllocatedInAlloc()

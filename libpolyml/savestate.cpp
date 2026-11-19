@@ -2499,6 +2499,15 @@ void ModuleExporter::Perform()
         errorMessage = "Module root is not an address";
         return;
     }
+    // A loaded module's file must not be replaced: states record modules by path.
+    for (std::vector<LoadedModuleData>::const_iterator m = loadedModules.cbegin(); m != loadedModules.cend(); m++)
+    {
+        if (!m->fileName.empty() && sameFile(m->fileName.c_str(), fileName))
+        {
+            errorMessage = "File being saved is a loaded module";
+            return;
+        }
+    }
     try {
 #if (defined(_WIN32) && defined(UNICODE))
         exportFile = _wfopen(fileName, L"wb");
@@ -2522,7 +2531,11 @@ void ModuleExporter::Perform()
             int fd = -1;
             for (unsigned attempt = 0; fd < 0 && attempt < 100; attempt++)
             {
-                tempName = publishName + "." + std::to_string((long)getpid()) + "." + std::to_string(sequence++);
+                // A short name in the same directory, so the rename stays atomic and a long
+                // destination name doesn't make it too long.
+                std::string::size_type slash = publishName.rfind('/');
+                tempName = (slash == std::string::npos ? std::string() : publishName.substr(0, slash + 1)) +
+                    ".pmo." + std::to_string((long)getpid()) + "." + std::to_string(sequence++);
                 fd = open(tempName.c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
                 if (fd < 0 && errno != EEXIST)
                     break;
@@ -2744,6 +2757,17 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         LoadedModuleData loadMod;
         loadMod.modId = header.thisModuleId;
         loadMod.fileName = fileName;
+#ifndef _WIN32
+        // Absolute, so that a state recording it can be loaded from another directory.
+        {
+            char *absolute = realpath(fileName.c_str(), NULL);
+            if (absolute != NULL)
+            {
+                loadMod.fileName = absolute;
+                free(absolute);
+            }
+        }
+#endif
         loadMod.modDependencies.reserve(header.dependencyCount);
 
         // Get the dependencies.  This is only needed to fill in the dependency vector.

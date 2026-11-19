@@ -1,7 +1,7 @@
-(* A state can't be saved over the file of a module it loaded: the save
-   would replace the module the state depends on.  One child saves module A;
-   another loads it and tries to save a state to A's file, which must fail
-   and leave A loadable. *)
+(* Neither a state nor a module can be saved over the file of a loaded module:
+   states record modules by path.  One child saves module A; another loads it
+   and tries to save a state and then a module to A's file, which must both
+   fail and leave A loadable. *)
 case #lookupStruct (PolyML.globalNameSpace) "Unix" of
     SOME _ => ()
 |   NONE => raise NotApplicable;
@@ -38,6 +38,10 @@ val overwrite =
     \val refused = (PolyML.SaveState.saveChildWithModules (" ^ quoted "A.pmo" ^ ", 0); false)\n\
     \              handle OS.SysErr _ => true;\n\
     \val () = if refused then () else raise Fail \"saved over A.pmo\";\n\
+    \structure A2 = struct val x = 1 end;\n\
+    \val refusedModule = (PolyML.SaveState.saveModule (" ^ quoted "A.pmo" ^ ", {structs = [\"A2\"], functors = [], sigs = [], onStartup = NONE}); false)\n\
+    \                    handle OS.SysErr _ => true;\n\
+    \val () = if refusedModule then () else raise Fail \"module saved over A.pmo\";\n\
     \val () = OS.Process.exit OS.Process.success;\n";
 
 val loadA =

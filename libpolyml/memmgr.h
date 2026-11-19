@@ -496,6 +496,7 @@ public:
 private:
     friend class Processes;
     bool AddLocalSpace(LocalMemSpace *space);
+    void InsertLocalSpace(LocalMemSpace *space);
     bool AddCodeSpace(CodeSpace *space);
 
     // Non-owning free-space index, protected by codeSpaceLock or stop-the-world GC.
@@ -526,6 +527,8 @@ private:
 
     void AddTreeRange(SpaceTree **t, MemSpace *space, uintptr_t startS, uintptr_t endS);
     void RemoveTreeRange(SpaceTree **t, MemSpace *space, uintptr_t startS, uintptr_t endS);
+    void ReplaceTree(MemSpace *oldS, MemSpace *newS);
+    void ReplaceTreeRange(SpaceTree **t, MemSpace *oldS, MemSpace *newS, uintptr_t startS, uintptr_t endS);
 
 #ifdef POLYML32IN64
     OSMemInRegion osHeapAlloc, osStackAlloc, osCodeAlloc;

@@ -12,6 +12,26 @@ case (#lookupStruct (PolyML.globalNameSpace) "Unix",
 (* Only Linux maps module data, and not in 32-in-64, which also has another layout. *)
 val () = if OS.FileSys.access ("/proc/self/maps", [OS.FileSys.A_READ]) andalso Word.wordSize = 63
          then () else raise NotApplicable;
+(* Nor where the user address space doesn't reach the module region, which starts
+   at 0x300000000000: the stack is near the top of the address space. *)
+val () =
+let
+    val maps = TextIO.openIn "/proc/self/maps"
+    fun stackEnd () =
+        case TextIO.inputLine maps of
+            NONE => NONE
+        |   SOME line =>
+                if String.isSubstring "[stack]" line
+                then case String.tokens (fn c => c = #"-" orelse c = #" ") line of
+                         _ :: e :: _ => LargeWord.fromString e
+                     |   _ => NONE
+                else stackEnd ()
+    val e = stackEnd () before TextIO.closeIn maps
+in
+    case e of
+        SOME e => if e > 0wx300000000000 then () else raise NotApplicable
+    |   NONE => raise NotApplicable
+end;
 
 val dir = OS.FileSys.tmpName ();
 val () = OS.FileSys.remove dir handle OS.SysErr _ => ();
