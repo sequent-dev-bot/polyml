@@ -584,8 +584,11 @@ PermanentMemSpace* MemMgr::NewExportSpace(uintptr_t size, bool mut, bool noOv, b
                 noOv ? "no-overwrite " : "", code ? "code " : "", space,
                 space->spaceSize() / 1024, space->bottom, space->top);
 
-        // Add to the table.
+        // Add to the table.  Reserve the pSpaces entry promoting the space will need,
+        // so that promotion, which a state save does once references point into the
+        // export spaces, can't fail.
         try {
+            pSpaces.reserve(pSpaces.size() + eSpaces.size() + 1);
             AddTree(space);
             eSpaces.push_back(space);
         }
@@ -754,17 +757,6 @@ void MemMgr::DeletePermanentSpaces(ModuleId modId)
 
 // Turn export spaces into permanent spaces.  Used for saved states and also for modules.
 // If that fails, nothing is changed.
-bool MemMgr::ReserveForPromotion()
-{
-    try {
-        pSpaces.reserve(pSpaces.size() + eSpaces.size());
-        return true;
-    }
-    catch (std::bad_alloc&) {
-        return false;
-    }
-}
-
 bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
 {
     size_t oldCount = pSpaces.size();

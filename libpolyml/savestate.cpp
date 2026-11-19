@@ -680,9 +680,10 @@ void SaveRequest::Perform()
         bool success = true;
         try {
             copyScan.initialise();
-            for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
+            // By index: making an export space reserves pSpaces capacity, which may move it.
+            for (size_t n = 0; n < gMem.pSpaces.size(); n++)
             {
-                PermanentMemSpace* space = *i;
+                PermanentMemSpace* space = gMem.pSpaces[n];
                 if (space->isMutable && !space->noOverwrite && !space->byteOnly)
                 {
                     if (debugOptions & DEBUG_SAVING)
@@ -755,18 +756,8 @@ void SaveRequest::Perform()
 
         memTableEntries = memTableCount;
 
-        // Once the locals are switched, the export spaces must become permanent, so
-        // reserve what that needs first.  Until then the copy can still be undone.
-        if (!gMem.ReserveForPromotion())
-        {
-            CopyScan::revertToLocal();
-            errorMessage = "Out of Memory";
-            errNumber = NOMEMORY;
-            if (debugOptions & DEBUG_SAVING)
-                Log("SAVE: Unable to reserve space to promote export spaces.\n");
-            return;
-        }
-
+        // Promoting the export spaces after the locals are switched can't fail: the
+        // pSpaces capacity it needs was reserved as each export space was made.
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Updating references to moved objects.\n");
         // We always switch to the permanent space even if there's been a
@@ -1272,7 +1263,15 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
             errorBuffer = "Required module missing or changed (";
             errorBuffer += modError;
             errorBuffer += "): ";
-            errorBuffer += std::string((const char*)m->path.c_str(), m->path.size() * sizeof(TCHAR));
+            {
+                std::vector<char> path(m->path.size() * sizeof(TCHAR) + 1);
+#if (defined(_WIN32) && defined(UNICODE))
+                sprintf(path.data(), "%S", m->path.c_str());
+#else
+                sprintf(path.data(), "%s", m->path.c_str());
+#endif
+                errorBuffer += path.data();
+            }
             errorResult = errorBuffer.c_str();
             errNumber = 0;
             return false;
@@ -2495,9 +2494,11 @@ void ModuleExporter::Perform()
             publishName = existing != NULL ? existing : fileName;
             free(existing);
             // Created with the old file's permissions, or as a new file is, less the umask.
-            // Not set with fchmod afterwards: sandboxes may forbid it.
+            // If the umask removed some of the old file's permissions, they are set with
+            // fchmod, ignoring a failure: sandboxes may forbid it.
             struct stat oldStat;
-            mode_t mode = stat(publishName.c_str(), &oldStat) == 0 ? (oldStat.st_mode & 0777) : 0666;
+            bool replacing = stat(publishName.c_str(), &oldStat) == 0;
+            mode_t mode = replacing ? (oldStat.st_mode & 0777) : 0666;
             static unsigned long sequence = 0;
             int fd = -1;
             for (unsigned attempt = 0; fd < 0 && attempt < 100; attempt++)
@@ -2513,11 +2514,17 @@ void ModuleExporter::Perform()
                 tempName.clear();
                 errno = err;
             }
-            else if ((exportFile = fdopen(fd, "wb")) == NULL)
+            else
             {
-                int err = errno;
-                close(fd);
-                errno = err;
+                struct stat newStat;
+                if (replacing && fstat(fd, &newStat) == 0 && (newStat.st_mode & 0777) != mode)
+                    (void)fchmod(fd, mode);
+                if ((exportFile = fdopen(fd, "wb")) == NULL)
+                {
+                    int err = errno;
+                    close(fd);
+                    errno = err;
+                }
             }
         }
 #endif
@@ -2877,7 +2884,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     {
                         return fail("Unable to seek to segment");
                     }
-                    if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
+                    if (readData(newSpace->writeAble(newSpace->bottom), descr->segmentSize, loadFile) != 1)
                     {
                         return fail("Unable to read segment");
                     }

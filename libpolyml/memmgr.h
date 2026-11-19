@@ -351,8 +351,6 @@ public:
     PermanentMemSpace *NewExportSpace(uintptr_t size, bool mut, bool noOv, bool code);
     void DeleteExportSpaces(void);
     bool PromoteNewExportSpaces(ModuleId newModId); // Turn export spaces into permanent spaces.
-    // Reserve what PromoteNewExportSpaces needs, so that it cannot then fail.
-    bool ReserveForPromotion();
     bool DemoteOldPermanentSpaces(ModuleId modId); // Turn any old permanent spaces with this ID into local spaces.
     void DeletePermanentSpaces(ModuleId modId); // Remove and free the spaces a failed module load added.
 #ifdef POLYML_MAP_SAVED_STATES
