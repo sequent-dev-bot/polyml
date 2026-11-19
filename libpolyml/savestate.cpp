@@ -645,14 +645,20 @@ void SaveRequest::Perform()
         // Include any existing states at a higher level
         for (unsigned i = 0; i < newHierarchy - 1; i++)
             copyScan.dependencies[hierarchyTable[i].timeStamp] = true;
+        // The modules a retained level recorded are loaded with it, so they are dependencies
+        // whether or not this state records modules itself.
+        std::unordered_set<uint64_t> recorded;
+        for (unsigned i = 0; i < newHierarchy - 1; i++)
+            for (std::vector<ModuleId>::const_iterator m = hierarchyTable[i].modules.cbegin(); m != hierarchyTable[i].modules.cend(); m++)
+                if (loadedModuleIds.count(ModuleKey(*m)) != 0)
+                {
+                    recorded.insert(ModuleKey(*m));
+                    copyScan.dependencies[*m] = true;
+                }
         // The modules this state depends on that no retained level recorded.
         std::vector<const LoadedModuleData*> moduleTable;
         if (withModules)
         {
-            std::unordered_set<uint64_t> recorded;
-            for (unsigned i = 0; i < newHierarchy - 1; i++)
-                for (std::vector<ModuleId>::const_iterator m = hierarchyTable[i].modules.cbegin(); m != hierarchyTable[i].modules.cend(); m++)
-                    recorded.insert(ModuleKey(*m));
             // A module is a dependency if it was loaded from a file and everything it depends on
             // is retained.  Modules are loaded after their dependencies so one pass in load order is enough.
             for (std::vector<LoadedModuleData>::const_iterator m = loadedModules.cbegin(); m != loadedModules.cend(); m++)

@@ -2,8 +2,8 @@
    files instead of copying them.  One child poly saves module A and module B,
    which depends on A.  Another loads B, and so A, saves a state with the
    modules and, for comparison, one without.  Further children load the state,
-   which loads the modules, and save a child of it, and loading the state fails
-   cleanly when A has changed or is missing. *)
+   which loads the modules, and save children of it, with modules and without,
+   and loading the state fails cleanly when A has changed or is missing. *)
 case #lookupStruct (PolyML.globalNameSpace) "Unix" of
     SOME _ => ()
 |   NONE => raise NotApplicable;
@@ -35,6 +35,7 @@ fun contentsOf s = "{structs = [\"" ^ s ^ "\"], functors = [], sigs = [], onStar
 val save =
     "structure A = struct\n\
     \  val xs = List.tabulate (20000, fn i => (i, Int.toString i ^ \"-a\", real i / 2.0))\n\
+    \  val r = ref 0\n\
     \end;\n\
     \val idA = PolyML.SaveState.saveModule (" ^ quoted "A.pmo" ^ ", " ^ contentsOf "A" ^ ");\n\
     \structure B = struct\n\
@@ -66,7 +67,9 @@ val saveWithModules =
     \val () = OS.Process.exit OS.Process.success;\n";
 
 (* The state loads the modules and refers to their data.  A child state saved
-   from it with modules records none itself: its parent does. *)
+   from it with modules records none itself: its parent does.  A child saved
+   without modules also refers to the modules' data and records a change to a
+   ref in them rather than copying it. *)
 val loadAndSaveChild =
     "val () = PolyML.SaveState.loadState " ^ quoted "state" ^ ";\n\
     \val () = if List.length (PolyML.SaveState.showLoadedModules ()) = 2 then () else raise Fail \"modules not loaded\";\n" ^
@@ -74,12 +77,21 @@ val loadAndSaveChild =
     "val C = List.map (fn (i, _, _) => i * 2) A.xs;\n\
     \val () = PolyML.SaveState.saveChildWithModules (" ^ quoted "child" ^ ", 1);\n\
     \val () = if PolyML.SaveState.showModuleDependencies " ^ quoted "child" ^ " = [] then () else raise Fail \"child dependencies\";\n\
+    \val () = A.r := 7;\n\
+    \val () = PolyML.SaveState.saveChild (" ^ quoted "plainchild" ^ ", 1);\n\
     \val () = OS.Process.exit OS.Process.success;\n";
 
 val loadChild =
     "val () = PolyML.SaveState.loadState " ^ quoted "child" ^ ";\n" ^
     checkAB ^
     "val () = if C = List.tabulate (20000, fn i => i * 2) then () else raise Fail \"C value\";\n\
+    \val () = OS.Process.exit OS.Process.success;\n";
+
+val loadPlainChild =
+    "val () = PolyML.SaveState.loadState " ^ quoted "plainchild" ^ ";\n" ^
+    checkAB ^
+    "val () = if C = List.tabulate (20000, fn i => i * 2) then () else raise Fail \"C value\";\n\
+    \val () = if !A.r = 7 then () else raise Fail \"A.r value\";\n\
     \val () = OS.Process.exit OS.Process.success;\n";
 
 val changeA =
@@ -99,15 +111,20 @@ val smaller = savedState andalso
     OS.FileSys.fileSize (file "state") + OS.FileSys.fileSize (file "A.pmo") div 2 < OS.FileSys.fileSize (file "plain");
 val loaded = savedState andalso runChild loadAndSaveChild;
 val childLoaded = loaded andalso runChild loadChild;
+val plainChildLoaded = loaded andalso runChild loadPlainChild;
+val plainChildSmaller = loaded andalso
+    OS.FileSys.fileSize (file "plainchild") < OS.FileSys.fileSize (file "child") + OS.FileSys.fileSize (file "A.pmo") div 2;
 val changedFails = savedState andalso runChild changeA andalso runChild (loadFails "Module has a different id");
 val () = OS.FileSys.remove (file "A.pmo") handle OS.SysErr _ => ();
 val missingFails = savedState andalso runChild (loadFails "Cannot open load file");
-val () = List.app (fn f => OS.FileSys.remove (file f) handle OS.SysErr _ => ()) ["A.pmo", "B.pmo", "state", "plain", "child"];
+val () = List.app (fn f => OS.FileSys.remove (file f) handle OS.SysErr _ => ()) ["A.pmo", "B.pmo", "state", "plain", "child", "plainchild"];
 val () = OS.FileSys.rmDir dir handle OS.SysErr _ => ();
 if saved then () else raise Fail "saving the modules failed";
 if savedState then () else raise Fail "saving the state with modules failed or listed the wrong modules";
 if smaller then () else raise Fail "the state with modules holds a copy of their data";
 if loaded then () else raise Fail "the state did not load its modules intact or save a child";
 if childLoaded then () else raise Fail "the child of the state did not load intact";
+if plainChildLoaded then () else raise Fail "the plain child of the state did not load intact";
+if plainChildSmaller then () else raise Fail "the plain child of the state holds a copy of the modules' data";
 if changedFails then () else raise Fail "loading the state with a changed module did not fail cleanly";
 if missingFails then () else raise Fail "loading the state with a missing module did not fail cleanly";
