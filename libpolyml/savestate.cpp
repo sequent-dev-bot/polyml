@@ -185,6 +185,58 @@ private:
     BASE m_value;
 };
 
+// Module load statistics, printed at exit when POLY_MODLOAD_STATS is set.
+#include <time.h>
+namespace {
+struct ModLoadStats {
+    bool on;
+    double call, perform, info, open, hdr, deps, descr, map, read, relocHdr, relocApply, prot;
+    unsigned long modules, infos, segs, idxSegs, mapped, copied, mapFail, moved, runs, runsApplied, relocs, pages;
+    unsigned long long mappedBytes, copiedBytes;
+};
+ModLoadStats mls;
+bool mlsInit = false;
+static double mlsNow()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static void mlsPrint()
+{
+    fprintf(stderr,
+        "MODLOAD modules=%lu infos=%lu segs=%lu idxsegs=%lu mapped=%lu mapfail=%lu copied=%lu moved=%lu "
+        "runs=%lu runsapplied=%lu relocs=%lu patchedpages=%lu mappedbytes=%llu copiedbytes=%llu\n",
+        mls.modules, mls.infos, mls.segs, mls.idxSegs, mls.mapped, mls.mapFail, mls.copied, mls.moved,
+        mls.runs, mls.runsApplied, mls.relocs, mls.pages, mls.mappedBytes, mls.copiedBytes);
+    fprintf(stderr,
+        "MODLOAD time call=%.4f perform=%.4f handoff=%.4f getinfo=%.4f open=%.4f hdr=%.4f deps=%.4f descr=%.4f "
+        "mmap=%.4f read=%.4f relochdr=%.4f relocapply=%.4f mprotect=%.4f\n",
+        mls.call, mls.perform, mls.call - mls.perform, mls.info, mls.open, mls.hdr, mls.deps, mls.descr,
+        mls.map, mls.read, mls.relocHdr, mls.relocApply, mls.prot);
+}
+static bool mlsOn()
+{
+    if (!mlsInit)
+    {
+        mlsInit = true;
+        mls = ModLoadStats();
+        mls.on = getenv("POLY_MODLOAD_STATS") != 0;
+        if (mls.on) atexit(mlsPrint);
+    }
+    return mls.on;
+}
+// Adds the time since construction to a counter when stats are on.
+class MlsTimer {
+public:
+    MlsTimer(double& c) : counter(c), start(mlsOn() ? mlsNow() : 0) {}
+    ~MlsTimer() { if (mls.on) counter += mlsNow() - start; }
+private:
+    double& counter;
+    double start;
+};
+}
+
 #ifdef HAVE__FTELLI64
 // fseek and ftell are only 32-bits in Windows.
 #define off_t   __int64
@@ -2426,6 +2478,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
     const char*& errorResult, int& errNumber, PolyObject*& root, ModuleId& loadedId)
 {
     {
+        bool stats = mlsOn();
+        double t0 = stats ? mlsNow() : 0;
         AutoClose loadFile(_tfopen(fileName.c_str(), _T("rb")));
         if ((FILE*)loadFile == NULL)
         {
@@ -2433,6 +2487,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             errNumber = ERRORNUMBER;
             return false;
         }
+        double t1 = stats ? mlsNow() : 0;
+        if (stats) { mls.modules++; mls.open += t1 - t0; }
 
         ModuleHeader header;
         // Read the header and check the signature.
@@ -2441,6 +2497,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             errorResult = "Unable to load header";
             return false;
         }
+        if (stats) { double t = mlsNow(); mls.hdr += t - t1; t1 = t; }
         if (strncmp(header.headerSignature, MODULESIGNATURE, sizeof(header.headerSignature)) != 0)
         {
             errorResult = "File is not a Poly/ML module";
@@ -2494,6 +2551,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             }
             loadMod.modDependencies.push_back(modDepEntry.depId);
         }
+        if (stats) { double t = mlsNow(); mls.deps += t - t1; t1 = t; }
 
         // We could check the dependency table at this point but other than perhaps improving
         // the error message if a dependency is missing there's no point.
@@ -2517,6 +2575,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             }
             descrs.push_back(msd);
         }
+        if (stats) { double t = mlsNow(); mls.descr += t - t1; t1 = t; }
 
         std::vector<ModuleLoadData> loadData;
         loadData.reserve(header.segmentDescrCount);
@@ -2539,8 +2598,10 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             load.relocRunCount = descr->relocRunCount;
             load.relocations = descr->relocations;
 
+            if (stats) mls.segs++;
             if (descr->segmentData == 0)
             { // No data - just an entry in the index.
+                if (stats) mls.idxSegs++;
                 if (space == NULL)
                 {
                     errorResult = "Required memory space is not present";
@@ -2570,17 +2631,22 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                 if (descr->originalAddr != 0 && descr->segmentFlags == 0 &&
                         descr->segmentSize <= fileSize && (uint64_t)descr->segmentData <= fileSize - descr->segmentSize)
                 {
+                    MlsTimer tm(mls.map);
                     newSpace = gMem.MapPermanentSpace((void*)descr->originalAddr, descr->segmentSize,
                         fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, header.thisModuleId);
                     if (newSpace != 0)
                     {
                         mappedSpace = newSpace;
                         load.moved = false;
+                        if (stats) { mls.mapped++; mls.mappedBytes += descr->segmentSize; }
                     }
+                    else if (stats) mls.mapFail++;
                 }
 #endif
                 if (newSpace == 0)
                 {
+                    MlsTimer tr(mls.read);
+                    if (stats) { mls.copied++; mls.copiedBytes += descr->segmentSize; }
                     // TODO: This creates the new space as though it existed in the original executable.
                     // We need to distinguish it somehow so we know which module it came from.
                     newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, header.thisModuleId);
@@ -2607,8 +2673,10 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                 }
                 load.targetAddr = newSpace->bottom;
             }
+            if (stats && load.moved) mls.moved++;
             loadData.push_back(load);
         }
+        std::unordered_set<uintptr_t> patched;
         // Now deal with relocation.  A relocation sets a location to an address in a target
         // segment.  The data in the file already holds that value unless the segment it is
         // in or the target segment is not where the descriptors say.
@@ -2622,12 +2690,14 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             if (i->relocations)
             {
                 std::vector<ModRelocationRun> runs(i->relocRunCount);
+                double th = stats ? mlsNow() : 0;
                 if (fseek(loadFile, i->relocations, SEEK_SET) != 0 ||
                         (!runs.empty() && fread(runs.data(), sizeof(ModRelocationRun), runs.size(), loadFile) != runs.size()))
                 {
                     errorResult = "Unable to read relocation segment";
                     continue;
                 }
+                if (stats) { mls.relocHdr += mlsNow() - th; mls.runs += runs.size(); }
                 off_t runStart = i->relocations + (off_t)(runs.size() * sizeof(ModRelocationRun));
                 std::vector<ModRelocationEntry> relocs;
                 for (std::vector<ModRelocationRun>::iterator run = runs.begin(); run < runs.end(); run++)
@@ -2635,6 +2705,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     ASSERT(run->targetSegment < header.segmentDescrCount);
                     if (i->moved || loadData[run->targetSegment].moved)
                     {
+                        MlsTimer ta(mls.relocApply);
+                        if (stats) { mls.runsApplied++; mls.relocs += run->count; }
                         relocs.resize(run->count);
                         if (fseek(loadFile, runStart, SEEK_SET) != 0 ||
                                 fread(relocs.data(), sizeof(ModRelocationEntry), run->count, loadFile) != run->count)
@@ -2645,6 +2717,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                             for (std::vector<ModRelocationEntry>::iterator reloc = relocs.begin(); reloc < relocs.end(); reloc++)
                             {
                                 byte* setAddress = (byte*)baseAddr + reloc->relocAddress;
+                                if (stats) patched.insert((uintptr_t)setAddress >> 12);
                                 ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetBase + reloc->targetAddress), reloc->relKind);
                             }
                         }
@@ -2655,8 +2728,12 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         }
 #ifdef POLYML_MAP_SAVED_STATES
         if (mappedSpace != 0)
+        {
+            MlsTimer tp(mls.prot);
             gMem.WriteProtectMappedSpace(mappedSpace);
+        }
 #endif
+        if (stats) mls.pages += patched.size();
 
         // Get the root address.
         {
@@ -2675,6 +2752,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
 
 void ModuleLoader::Perform()
 {
+    MlsTimer tp(mls.perform);
     try {
         PolyObject* root;
         if (loadModuleFile(fileName, NULL, errorResult, errNumber, root, loadedModId))
@@ -2695,7 +2773,10 @@ static Handle LoadModule(TaskData* taskData, Handle args)
 {
     std_tstring fileName = PolyStringToTString(args->Word());
     ModuleLoader loader(taskData, fileName);
-    processes->MakeRootRequest(taskData, &loader);
+    {
+        MlsTimer tc(mls.call);
+        processes->MakeRootRequest(taskData, &loader);
+    }
 
     if (loader.errorResult != 0)
     {
@@ -2914,6 +2995,8 @@ POLYUNSIGNED PolyGetModuleInfo(POLYUNSIGNED threadId, POLYUNSIGNED arg)
     Handle result = 0;
 
     try {
+        MlsTimer ti(mls.info);
+        if (mls.on) mls.infos++;
         result = GetModInfo(taskData, pushedArg);
     }
     catch (const std::bad_alloc&) { setMemoryException(taskData); }
