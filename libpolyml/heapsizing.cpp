@@ -90,6 +90,17 @@ static long GetPaging(long)
 {
     return 0;
 }
+#elif defined(POLYML_MAP_SAVED_STATES)
+// Once saved-state or module data is mapped from its file, ru_majflt also counts every
+// page of it read in from disk, which says nothing about the heap being paged.  From
+// then on the count stays where it was.
+static long GetPaging(long rusagePage)
+{
+    static long heapPaging = 0;
+    if (!gMem.HasMappedFileData())
+        heapPaging = rusagePage;
+    return heapPaging;
+}
 #else
 inline long GetPaging(long rusagePage)
 {

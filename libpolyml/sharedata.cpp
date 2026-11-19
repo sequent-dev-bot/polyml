@@ -744,10 +744,13 @@ POLYUNSIGNED ProcessAddToVector::AddObjectToDepthVector(PolyObject *obj)
         // because they may point to mutable areas containing data
         // that can be.  A typical case is the root function pointing
         // at the global name table containing new declarations.
+        // Indexed by the object's length word: an object of length zero at the
+        // top of the space starts at the top, one past the bitmap.
         Bitmap *bm = &((PermanentMemSpace*)space)->shareBitmap;
-        if (! bm->TestBit((PolyWord*)obj - space->bottom))
+        uintptr_t bit = ((PolyWord*)obj - 1) - space->bottom;
+        if (! bm->TestBit(bit))
         {
-            bm->SetBit((PolyWord*)obj - space->bottom);
+            bm->SetBit(bit);
             if (! obj->IsByteObject())
                 PushToStack(obj);
         }
