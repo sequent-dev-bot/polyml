@@ -9,7 +9,9 @@ case (#lookupStruct (PolyML.globalNameSpace) "Unix",
       #lookupStruct (PolyML.globalNameSpace) "Foreign") of
     (SOME _, SOME _) => ()
 |   _ => raise NotApplicable;
-val () = if OS.FileSys.access ("/proc/self/maps", [OS.FileSys.A_READ]) then () else raise NotApplicable;
+(* Only Linux maps module data, and not in 32-in-64, which also has another layout. *)
+val () = if OS.FileSys.access ("/proc/self/maps", [OS.FileSys.A_READ]) andalso Word.wordSize = 63
+         then () else raise NotApplicable;
 
 val dir = OS.FileSys.tmpName ();
 val () = OS.FileSys.remove dir handle OS.SysErr _ => ();

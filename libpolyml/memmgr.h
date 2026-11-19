@@ -304,6 +304,11 @@ public:
     PermanentMemSpace *MapPermanentSpace(void *addr, uintptr_t byteSize, int fd, uint64_t offset,
         unsigned flags, unsigned index, ModuleId sourceModule);
     void WriteProtectMappedSpace(PermanentMemSpace *space);
+    // Whether any space has been mapped from a file.  Its pages read in count as major faults.
+    bool HasMappedFileData() const { return mappedFileData; }
+private:
+    bool mappedFileData;
+public:
 #endif
 
     // Delete a local space.  Takes the iterator position in lSpaces and returns the
@@ -346,6 +351,7 @@ public:
     void DeleteExportSpaces(void);
     bool PromoteNewExportSpaces(ModuleId newModId); // Turn export spaces into permanent spaces.
     bool DemoteOldPermanentSpaces(ModuleId modId); // Turn any old permanent spaces with this ID into local spaces.
+    void DeletePermanentSpaces(ModuleId modId); // Remove and free the spaces a failed module load added.
 #ifdef POLYML_MAP_SAVED_STATES
 private:
     void *AllocateInStateRegion(size_t &space);

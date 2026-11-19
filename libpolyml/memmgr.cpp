@@ -144,6 +144,9 @@ bool LocalMemSpace::InitSpace(PolyWord *heapSpace, uintptr_t size, bool mut)
 MemMgr::MemMgr(): allocLock("Memmgr alloc"), codeBitmapLock("Code bitmap")
 {
     nextIndex = 0;
+#ifdef POLYML_MAP_SAVED_STATES
+    mappedFileData = false;
+#endif
     reservedSpace = 0;
     nextAllocator = 0;
     defaultSpaceSize = 0;
@@ -431,6 +434,7 @@ PermanentMemSpace *MemMgr::MapPermanentSpace(void *addr, uintptr_t byteSize, int
         if (index >= nextIndex) nextIndex = index + 1;
         AddTree(space);
         AddPermanentSpace(space);
+        mappedFileData = true;
         return space;
     }
     catch (std::exception&) {
@@ -726,20 +730,65 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
     return true;
 }
 
+// Remove the permanent spaces with this module id that a failed module load added, and
+// free their memory.  Nothing outside them refers to them, so unlike demoting them this
+// doesn't scan their contents, which may be partly read or unrelocated.
+void MemMgr::DeletePermanentSpaces(ModuleId modId)
+{
+    std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin();
+    while (i != pSpaces.end())
+    {
+        PermanentMemSpace* pSpace = *i;
+        if (pSpace->moduleIdentifier != modId)
+            i++;
+        else
+        {
+            RemoveFromSpaceIndex(pSpace);
+            i = pSpaces.erase(i);
+            RemoveTree(pSpace); // Before freeing it: another thread may allocate the memory.
+            delete pSpace;
+        }
+    }
+}
+
 // Turn export spaces into permanent spaces.  Used for saved states and also for modules.
+// If that fails, nothing is changed.
 bool MemMgr::PromoteNewExportSpaces(ModuleId newModId)
 {
+    size_t oldCount = pSpaces.size();
+    try {
+        pSpaces.reserve(oldCount + eSpaces.size());
+        for (std::vector<PermanentMemSpace*>::iterator j = eSpaces.begin(); j < eSpaces.end(); j++)
+        {
+            PermanentMemSpace* space = *j;
+            ModuleId oldId = space->moduleIdentifier;
+            space->moduleIdentifier = newModId;
+            try {
+                AddPermanentSpace(space);
+            }
+            catch (std::bad_alloc&) {
+                space->moduleIdentifier = oldId;
+                throw;
+            }
+        }
+    }
+    catch (std::bad_alloc&) {
+        while (pSpaces.size() > oldCount)
+        {
+            PermanentMemSpace* space = pSpaces.back();
+            RemoveFromSpaceIndex(space);
+            pSpaces.pop_back();
+        }
+        return false;
+    }
     // Save newly exported spaces.
     for(std::vector<PermanentMemSpace *>::iterator j = eSpaces.begin(); j < eSpaces.end(); j++)
     {
         PermanentMemSpace *space = *j;
         space->spaceType = ST_PERMANENT;
-        space->moduleIdentifier = newModId;
         // Put a dummy object to fill up the unused space.
         if (space->topPointer != space->top)
             FillUnusedSpace(space->writeAble(space->topPointer), space->top - space->topPointer);
-        // Put in a dummy object to fill the rest of the space.
-        AddPermanentSpace(space);
     }
     eSpaces.clear();
 

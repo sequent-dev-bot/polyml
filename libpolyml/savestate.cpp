@@ -78,6 +78,7 @@
 #include <string>
 #include <algorithm>
 #include <unordered_set>
+#include <stdexcept>
 
 #if (defined(_WIN32))
 #include <tchar.h>
@@ -1948,7 +1949,12 @@ static void storeAddress(byte* addressToWrite, uintptr_t valu)
 // The number of bytes a relocation of this kind sets.
 static size_t RelocationSize(ScanRelocationKind kind)
 {
-    return kind == PROCESS_RELOC_I386RELATIVE || kind == PROCESS_RELOC_C32ADDR ? 4 : 8;
+    switch (kind)
+    {
+    case PROCESS_RELOC_DIRECT: return sizeof(uintptr_t);
+    case PROCESS_RELOC_I386RELATIVE: case PROCESS_RELOC_C32ADDR: return 4;
+    default: return 8; // An ARM64 instruction pair.
+    }
 }
 
 // A hash of a module's content and layout.  It has no time or sequence seed, so
@@ -2071,6 +2077,12 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         CopyScan::revertToLocal();
         return;
     }
+    catch (std::bad_alloc&)
+    {
+        errorMessage = "Insufficient Memory : C++ allocation failed";
+        CopyScan::revertToLocal();
+        return;
+    }
 
     // Provisional: the id is computed from the module's content below.
     exportModId = copyScan.extractHash();
@@ -2078,7 +2090,15 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
     // Copy the areas into the export object.
     size_t tableSize = gMem.eSpaces.size() + gMem.pSpaces.size();
     unsigned memEntry = 0;
-    memTable = new ExportMemTable[tableSize];
+    try {
+        memTable = new ExportMemTable[tableSize];
+    }
+    catch (std::bad_alloc&)
+    {
+        errorMessage = "Insufficient Memory : C++ allocation failed";
+        CopyScan::revertToLocal();
+        return;
+    }
 
     // If we're constructing a module we need to include the global spaces.
     // Permanent spaces from the dependencies
@@ -2146,6 +2166,9 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         // flags, sizes and data, the root and the dependencies.  The data is hashed with
         // the locations relocations set zeroed, and a relocation's target by its module and
         // segment index, so the hash does not depend on where anything is in memory.
+        // Relocations are hashed in the order the segment's objects give them, not in the
+        // order of the target segments, which depends on the order dependencies were loaded.
+        // Data a load resets (ClearVolatile) is hashed zeroed: it can differ between writers.
         std::vector<std::vector<ModRelocationEntry> > segmentRelocations(this->memTableEntries);
         ModuleHash idHash;
         idHash.addWord(this->memTableEntries - newAreas);
@@ -2155,6 +2178,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             this->relocations.clear();
             char* start = (char*)entry->mtOriginalAddr;
             char* end = start + entry->mtLength;
+            std::vector<byte> zeroed((byte*)start, (byte*)end);
             for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
             {
                 p++;
@@ -2165,11 +2189,17 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                 if (length != 0 && obj->IsCodeObject())
                     machineDependent->ScanConstantsWithinCode(obj, this);
                 relocateObject(obj);
+                if (obj->IsMutable() && obj->IsNoOverwriteObject())
+                {
+                    size_t offset = (char*)obj - start;
+                    size_t bytes = obj->IsByteObject() && obj->IsWeakRefObject() ?
+                        (length >= sizeof(uintptr_t) / sizeof(PolyWord) ? sizeof(uintptr_t) : 0) :
+                        obj->IsByteObject() ? 0 : length * sizeof(PolyWord);
+                    memset(zeroed.data() + offset, 0, bytes);
+                }
                 p += length;
             }
-            std::stable_sort(this->relocations.begin(), this->relocations.end(), lessTargetSegment);
             idHash.addWord(entry->mtFlags);
-            std::vector<byte> zeroed((byte*)start, (byte*)end);
             for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
             {
                 ASSERT(r->relocAddress + RelocationSize(r->relKind) <= entry->mtLength);
@@ -2182,13 +2212,22 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                 idHash.addWord(r->relKind);
             }
             idHash.addBytes(zeroed.data(), zeroed.size());
+            // The file groups the relocations by target segment.
+            std::stable_sort(this->relocations.begin(), this->relocations.end(), lessTargetSegment);
             segmentRelocations[k].swap(this->relocations);
         }
         idHash.addWord(modHeader.rootSegment < newAreas ? ModuleKey(memTable[modHeader.rootSegment].mtModId) : 0);
         idHash.addWord(memTable[modHeader.rootSegment].mtIndex);
         idHash.addWord(modHeader.rootOffset);
-        for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
-            idHash.addWord(ModuleKey(i->modId));
+        {
+            // In a fixed order: the list's order depends on the order modules were loaded.
+            std::vector<uint64_t> dependencyKeys;
+            for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
+                dependencyKeys.push_back(ModuleKey(i->modId));
+            std::sort(dependencyKeys.begin(), dependencyKeys.end());
+            for (std::vector<uint64_t>::const_iterator i = dependencyKeys.cbegin(); i != dependencyKeys.cend(); i++)
+                idHash.addWord(*i);
+        }
         exportModId = idHash.result();
         for (unsigned k = newAreas; k < this->memTableEntries; k++)
             this->memTable[k].mtModId = exportModId;
@@ -2336,7 +2375,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             errorMessage = "Error while writing module";
             throw IOException();
         }
-#ifdef POLYML_MAP_SAVED_STATES
+#ifndef _WIN32
         if (rename(tempName.c_str(), publishName.c_str()) != 0)
         {
             errNumber = ERRORNUMBER;
@@ -2361,12 +2400,25 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
             loadMod.modDependencies.push_back(i->modId);
         loadedModules.push_back(loadMod);
-        loadedModuleIds.insert(ModuleKey(exportModId));
+        try {
+            loadedModuleIds.insert(ModuleKey(exportModId));
+        }
+        catch (...) {
+            loadedModules.pop_back();
+            throw;
+        }
 
-        // If it all succeeded we can switch over to the permanent spaces.
+        // If it all succeeded we can switch over to the permanent spaces.  If promoting
+        // them fails it changes nothing, and the module is not loaded.
         if (gMem.PromoteNewExportSpaces(exportModId))
             switchLocalsToPermanent();
-        else CopyScan::revertToLocal();
+        else
+        {
+            loadedModules.pop_back();
+            loadedModuleIds.erase(ModuleKey(exportModId));
+            errorMessage = "Insufficient Memory";
+            CopyScan::revertToLocal();
+        }
 
     }
     catch (IOException&)
@@ -2375,6 +2427,10 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
     }
     catch (MemoryException&) {
         errorMessage = "Insufficient Memory";
+        CopyScan::revertToLocal();
+    }
+    catch (std::bad_alloc&) {
+        errorMessage = "Insufficient Memory : C++ allocation failed";
         CopyScan::revertToLocal();
     }
 }
@@ -2394,7 +2450,9 @@ void ModuleExporter::Perform()
     try {
 #if (defined(_WIN32) && defined(UNICODE))
         exportFile = _wfopen(fileName, L"wb");
-#elif defined(POLYML_MAP_SAVED_STATES)
+#elif defined(_WIN32)
+        exportFile = fopen(fileName, "wb");
+#else
         {
             // Other processes may have the existing file mapped or be reading it: write a
             // new file beside it and rename it over the name when it is complete.  As saving
@@ -2427,8 +2485,6 @@ void ModuleExporter::Perform()
                 }
             }
         }
-#else
-        exportFile = fopen(fileName, "wb");
 #endif
         if (exportFile == NULL)
         {
@@ -2441,7 +2497,7 @@ void ModuleExporter::Perform()
     {
         errorMessage = "Insufficient Memory : C++ allocation failed";
     }
-#ifdef POLYML_MAP_SAVED_STATES
+#ifndef _WIN32
     // Not renamed: the export failed.
     if (!tempName.empty())
         unlink(tempName.c_str());
@@ -2697,13 +2753,16 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
 #endif
         PermanentMemSpace* mappedSpace = 0;
-        // Once a segment has been added, a failure must remove the module's segments again
-        // so that nothing is left half loaded or half relocated.
-        bool segmentsAdded = false;
+        // Once a segment has been added, a failure, an exception included, must remove the
+        // module's segments again so that nothing is left half loaded or half relocated.
+        // Only this load's segments have the module's id: that was checked above.
+        struct AddedSegments {
+            ModuleId modId;
+            bool added;
+            ~AddedSegments() { if (added) gMem.DeletePermanentSpaces(modId); }
+        } addedSegments = { ModuleId(header.thisModuleId), false };
         auto fail = [&](const char* message) {
             errorResult = message;
-            if (segmentsAdded)
-                (void)gMem.DemoteOldPermanentSpaces(header.thisModuleId);
             return false;
         };
 
@@ -2726,6 +2785,11 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                 if (descr->segmentSize != (size_t)((char*)space->topPointer - (char*)space->bottom))
                 {
                     return fail("Required memory space has a different size");
+                }
+                // A module sets locations only in its own segments.
+                if (descr->relocations != 0)
+                {
+                    return fail("Relocations in a segment the module does not own");
                 }
                 load.targetAddr = space->bottom;
                 load.moved = (uintptr_t)space->bottom != descr->originalAddr;
@@ -2750,7 +2814,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                         fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, header.thisModuleId);
                     if (newSpace != 0)
                     {
-                        segmentsAdded = true;
+                        addedSegments.added = true;
                         mappedSpace = newSpace;
                         load.moved = false;
                     }
@@ -2765,7 +2829,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     {
                         return fail("Unable to allocate memory");
                     }
-                    segmentsAdded = true;
+                    addedSegments.added = true;
                     if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
                     {
                         return fail("Unable to seek to segment");
@@ -2848,7 +2912,14 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
 
         // Now add the entry to the loaded module table
         loadedModules.push_back(loadMod);
-        loadedModuleIds.insert(ModuleKey(header.thisModuleId));
+        try {
+            loadedModuleIds.insert(ModuleKey(header.thisModuleId));
+        }
+        catch (...) {
+            loadedModules.pop_back();
+            throw;
+        }
+        addedSegments.added = false;
     }
     return errorResult == NULL;
 }
@@ -2866,6 +2937,10 @@ void ModuleLoader::Perform()
         }
     }
     catch (const std::bad_alloc&)
+    {
+        errorResult = "Insufficient Memory : C++ allocation failed";
+    }
+    catch (const std::length_error&) // A table size from the file is too large.
     {
         errorResult = "Insufficient Memory : C++ allocation failed";
     }
@@ -3131,6 +3206,18 @@ void ModuleReleaser::Perform()
             if (mod->modId == moduleId)
                 break;
             else mod++;
+        }
+        // A loaded saved state may refer to the module's data.
+        for (std::vector<HierarchyTable>::const_iterator h = hierarchyTable.cbegin(); h != hierarchyTable.cend(); h++)
+        {
+            for (std::vector<ModuleId>::const_iterator m = h->modules.cbegin(); m != h->modules.cend(); m++)
+            {
+                if (*m == moduleId)
+                {
+                    errorMessage = "Module is used by a loaded saved state";
+                    return;
+                }
+            }
         }
         loadedModules.erase(mod);
         loadedModuleIds.erase(ModuleKey(moduleId));
