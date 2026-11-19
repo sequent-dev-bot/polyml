@@ -695,7 +695,7 @@ struct _moduleId CopyScan::extractHash()
     a ^= c; a -= rot(c, 4);
     b ^= a; b -= rot(a, 14);
     c ^= b; c -= rot(b, 24);
-    return { hash_c, hash_b };
+    return { c, b };
 }
 
 // Convert the forwarding pointers in a region back into length words.

@@ -1907,6 +1907,10 @@ protected:
     void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
     unsigned relocationCount;
     std::vector<ModRelocationEntry> relocations; // For the segment being written.
+#ifdef POLYML_MAP_SAVED_STATES
+    // The module is written to tempName and renamed to publishName when it is complete.
+    std::string publishName, tempName;
+#endif
 
     friend class SaveRequest;
 };
@@ -1940,6 +1944,61 @@ static void storeAddress(byte* addressToWrite, uintptr_t valu)
         valu >>= 8;
     }
 }
+
+// The number of bytes a relocation of this kind sets.
+static size_t RelocationSize(ScanRelocationKind kind)
+{
+    return kind == PROCESS_RELOC_I386RELATIVE || kind == PROCESS_RELOC_C32ADDR ? 4 : 8;
+}
+
+// A hash of a module's content and layout.  It has no time or sequence seed, so
+// the same module written by any process gets the same id.
+class ModuleHash
+{
+public:
+    ModuleHash() : h1(0x9E3779B97F4A7C15ull), h2(0xC2B2AE3D27D4EB4Full), count(0) {}
+
+    void addWord(uint64_t w)
+    {
+        h1 = rotl((h1 ^ w) * 0x87C37B91114253D5ull, 31);
+        h2 = rotl((h2 ^ w) * 0x4CF5AD432745937Full, 33);
+        count++;
+    }
+
+    void addBytes(const byte* p, size_t n)
+    {
+        size_t i = 0;
+        for (; i + sizeof(uint64_t) <= n; i += sizeof(uint64_t))
+        {
+            uint64_t w;
+            memcpy(&w, p + i, sizeof(w));
+            addWord(w);
+        }
+        uint64_t tail = 0;
+        memcpy(&tail, p + i, n - i);
+        addWord(tail);
+        addWord(n);
+    }
+
+    struct _moduleId result() const
+    {
+        uint64_t h = mix(mix(h1 ^ count) + h2);
+        if (h == 0) h = 1;
+        struct _moduleId id = { (uint32_t)h, (uint32_t)(h >> 32) };
+        return id;
+    }
+
+private:
+    static uint64_t rotl(uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); }
+    static uint64_t mix(uint64_t x)
+    {
+        x ^= x >> 33; x *= 0xFF51AFD7ED558CCDull;
+        x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ull;
+        x ^= x >> 33;
+        return x;
+    }
+    uint64_t h1, h2, count;
+};
 
 // This is called by the initial thread to actually do the export.
 void ModuleExporter::RunModuleExport(PolyObject* rootFn)
@@ -2013,6 +2072,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         return;
     }
 
+    // Provisional: the id is computed from the module's content below.
     exportModId = copyScan.extractHash();
 
     // Copy the areas into the export object.
@@ -2081,6 +2141,59 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             modHeader.rootSegment = rootArea;
             modHeader.rootOffset = (POLYUNSIGNED)((char*)this->rootFunction - (char*)mt->mtOriginalAddr);
         }
+
+        // Collect the relocations of the new segments and hash them with the segments'
+        // flags, sizes and data, the root and the dependencies.  The data is hashed with
+        // the locations relocations set zeroed, and a relocation's target by its module and
+        // segment index, so the hash does not depend on where anything is in memory.
+        std::vector<std::vector<ModRelocationEntry> > segmentRelocations(this->memTableEntries);
+        ModuleHash idHash;
+        idHash.addWord(this->memTableEntries - newAreas);
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
+        {
+            ExportMemTable* entry = &this->memTable[k];
+            this->relocations.clear();
+            char* start = (char*)entry->mtOriginalAddr;
+            char* end = start + entry->mtLength;
+            for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+            {
+                p++;
+                PolyObject* obj = (PolyObject*)p;
+                POLYUNSIGNED length = obj->Length();
+                // For saved states we don't include explicit relocations except
+                // in code but it's easier if we do for modules.
+                if (length != 0 && obj->IsCodeObject())
+                    machineDependent->ScanConstantsWithinCode(obj, this);
+                relocateObject(obj);
+                p += length;
+            }
+            std::stable_sort(this->relocations.begin(), this->relocations.end(), lessTargetSegment);
+            idHash.addWord(entry->mtFlags);
+            std::vector<byte> zeroed((byte*)start, (byte*)end);
+            for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
+            {
+                ASSERT(r->relocAddress + RelocationSize(r->relKind) <= entry->mtLength);
+                memset(zeroed.data() + r->relocAddress, 0, RelocationSize(r->relKind));
+                const ExportMemTable* target = &this->memTable[r->targetSegment];
+                idHash.addWord(r->relocAddress);
+                idHash.addWord(r->targetSegment < newAreas ? ModuleKey(target->mtModId) : 0);
+                idHash.addWord(target->mtIndex);
+                idHash.addWord(r->targetAddress);
+                idHash.addWord(r->relKind);
+            }
+            idHash.addBytes(zeroed.data(), zeroed.size());
+            segmentRelocations[k].swap(this->relocations);
+        }
+        idHash.addWord(modHeader.rootSegment < newAreas ? ModuleKey(memTable[modHeader.rootSegment].mtModId) : 0);
+        idHash.addWord(memTable[modHeader.rootSegment].mtIndex);
+        idHash.addWord(modHeader.rootOffset);
+        for (std::vector<ModIdAndName>::const_iterator i = dependencies.cbegin(); i != dependencies.cend(); i++)
+            idHash.addWord(ModuleKey(i->modId));
+        exportModId = idHash.result();
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
+            this->memTable[k].mtModId = exportModId;
+        for (std::vector<PermanentMemSpace*>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
+            (*i)->moduleIdentifier = ModuleId(exportModId);
         modHeader.thisModuleId = exportModId;
         modHeader.segmentDescrCount = this->memTableEntries; // One segment for each space.
         // Write out the header.
@@ -2130,24 +2243,9 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             bool prelink = immutableSegments == 1 && this->memTable[k].mtFlags == 0;
             ModuleSegmentDescr* thisDescr = &descrs[k];
             ExportMemTable* entry = &this->memTable[k];
-            // Create the relocation table.
-            this->relocationCount = 0;
-            this->relocations.clear();
             char* start = (char*)entry->mtOriginalAddr;
             char* end = start + entry->mtLength;
-            for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
-            {
-                p++;
-                PolyObject* obj = (PolyObject*)p;
-                POLYUNSIGNED length = obj->Length();
-                // For saved states we don't include explicit relocations except
-                // in code but it's easier if we do for modules.
-                if (length != 0 && obj->IsCodeObject())
-                    machineDependent->ScanConstantsWithinCode(obj, this);
-                relocateObject(obj);
-                p += length;
-            }
-            std::stable_sort(this->relocations.begin(), this->relocations.end(), lessTargetSegment);
+            this->relocations.swap(segmentRelocations[k]);
             std::vector<ModRelocationRun> runs;
             for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
             {
@@ -2160,7 +2258,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                 if (r->relKind != PROCESS_RELOC_DIRECT)
                     prelink = false;
             }
-            thisDescr->relocationCount = this->relocationCount;
+            thisDescr->relocationCount = (unsigned)this->relocations.size();
             thisDescr->relocRunCount = (unsigned)runs.size();
             // Write out the data.  A prelinked segment is written with its pointers set for
             // it at its prelink address and the other segments where they are now.
@@ -2230,7 +2328,31 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
             throw IOException();
 
-        fclose(exportFile); exportFile = NULL;
+        int closed = fclose(exportFile);
+        exportFile = NULL;
+        if (closed != 0)
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Error while writing module";
+            throw IOException();
+        }
+#ifdef POLYML_MAP_SAVED_STATES
+        if (rename(tempName.c_str(), publishName.c_str()) != 0)
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Cannot rename module file";
+            throw IOException();
+        }
+        tempName.clear();
+#endif
+
+        // A module with the same content is already loaded: its segments have this id,
+        // so these ones stay local data.
+        if (loadedModuleIds.count(ModuleKey(exportModId)) != 0)
+        {
+            CopyScan::revertToLocal();
+            return;
+        }
 
         // Add this to the loaded module table.
         LoadedModuleData loadMod;
@@ -2259,21 +2381,51 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
 
 void ModuleExporter::Perform()
 {
+    // RunModuleExport copies everything reachable from the root, except data from
+    // the executable because we've set the hierarchy to 1, using CopyScan.
+    // It builds the tables in the export data structure then writes the data.
+    if (!root->Word().IsDataPtr())
+    {
+        // If we have a completely empty module the list may be null.
+        // This needs to be dealt with at a higher level.
+        errorMessage = "Module root is not an address";
+        return;
+    }
     try {
 #if (defined(_WIN32) && defined(UNICODE))
         exportFile = _wfopen(fileName, L"wb");
 #elif defined(POLYML_MAP_SAVED_STATES)
         {
-            // Other processes may have the existing file mapped: write a new file rather
-            // than truncating theirs, which would raise SIGBUS in them.
-            char *existing = realpath(fileName, NULL);
-            if (existing != NULL)
+            // Other processes may have the existing file mapped or be reading it: write a
+            // new file beside it and rename it over the name when it is complete.  As saving
+            // a state does, write to the file a symbolic link names and keep its permissions.
+            char *existing = realpath(fileName, NULL); // NULL if there's no file yet.
+            publishName = existing != NULL ? existing : fileName;
+            free(existing);
+            struct stat oldStat;
+            mode_t mode;
+            if (stat(publishName.c_str(), &oldStat) == 0)
+                mode = oldStat.st_mode & 0777;
+            else
             {
-                unlink(existing);
-                exportFile = fopen(existing, "wb");
-                free(existing);
+                mode_t mask = umask(0);
+                umask(mask);
+                mode = 0666 & ~mask;
             }
-            else exportFile = fopen(fileName, "wb");
+            std::string pattern = publishName + ".XXXXXX";
+            std::vector<char> temp(pattern.begin(), pattern.end());
+            temp.push_back(0);
+            int fd = mkstemp(temp.data());
+            if (fd >= 0)
+            {
+                tempName = temp.data();
+                if (fchmod(fd, mode) != 0 || (exportFile = fdopen(fd, "wb")) == NULL)
+                {
+                    int err = errno;
+                    close(fd);
+                    errno = err;
+                }
+            }
         }
 #else
         exportFile = fopen(fileName, "wb");
@@ -2282,25 +2434,18 @@ void ModuleExporter::Perform()
         {
             errorMessage = "Cannot open export file";
             errNumber = ERRORNUMBER;
-            return;
         }
-        // RunExport copies everything reachable from the root, except data from
-        // the executable because we've set the hierarchy to 1, using CopyScan.
-        // It builds the tables in the export data structure then calls exportStore
-        // to actually write the data.
-        if (!root->Word().IsDataPtr())
-        {
-            // If we have a completely empty module the list may be null.
-            // This needs to be dealt with at a higher level.
-            errorMessage = "Module root is not an address";
-            return;
-        }
-        RunModuleExport(root->WordP());
+        else RunModuleExport(root->WordP());
     }
     catch (const std::bad_alloc&)
     {
         errorMessage = "Insufficient Memory : C++ allocation failed";
     }
+#ifdef POLYML_MAP_SAVED_STATES
+    // Not renamed: the export failed.
+    if (!tempName.empty())
+        unlink(tempName.c_str());
+#endif
 }
 
 // Return a module Id as a string.  Also used in saved state.
