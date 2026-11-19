@@ -2088,6 +2088,10 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             for (std::vector <HierarchyTable>::iterator i = hierarchyTable.begin(); i < hierarchyTable.end(); i++)
             {
                 copyScan.dependencies[i->timeStamp] = true;
+                // The modules a level recorded are loaded with it, so their data is referenced too.
+                for (std::vector<ModuleId>::const_iterator r = i->modules.cbegin(); r != i->modules.cend(); r++)
+                    if (loadedModuleIds.count(ModuleKey(*r)) != 0)
+                        copyScan.dependencies[*r] = true;
                 if (m == i->timeStamp)
                     break;
             }
