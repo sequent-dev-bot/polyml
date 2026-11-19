@@ -19,6 +19,11 @@ COMPILER="${DEFAULT_COMPILER}"
 @NATIVE_WINDOWS_TRUE@@WINDOWSGUI_TRUE@EXTRALDFLAGS+=" -mwindows"
 @NATIVE_WINDOWS_TRUE@@WINDOWSGUI_FALSE@EXTRALDFLAGS+=" -mconsole"
 
+# On Linux, link the executable position-dependent.  Its exported ML heap then
+# has the same address in every run, so a module saved by one run loads in
+# another without patching each pointer into that heap.
+if [ "$(uname -s)" = Linux ]; then EXTRALDFLAGS="$EXTRALDFLAGS -no-pie"; fi
+
 @NATIVE_WINDOWS_TRUE@SUFFIX="obj"
 @NATIVE_WINDOWS_FALSE@SUFFIX="o"
 
