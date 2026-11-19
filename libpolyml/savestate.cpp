@@ -2668,6 +2668,24 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             }
             descrs.push_back(msd);
         }
+        if (header.rootSegment >= header.segmentDescrCount ||
+                header.rootOffset >= descrs[header.rootSegment].segmentSize)
+        {
+            errorResult = "Module root is outside its segment";
+            return false;
+        }
+        // The module's own segments must not be present yet: a failed load removes the
+        // segments with the module's id, which must be only those it added.
+        for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
+        {
+            if (descr->segmentData != 0 &&
+                (ModuleId(descr->moduleIden) != ModuleId(header.thisModuleId) ||
+                    gMem.SpaceForIndex(descr->segmentIndex, header.thisModuleId) != NULL))
+            {
+                errorResult = "Memory space with this signature already exists";
+                return false;
+            }
+        }
 
         std::vector<ModuleLoadData> loadData;
         loadData.reserve(header.segmentDescrCount);
@@ -2679,12 +2697,21 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
 #endif
         PermanentMemSpace* mappedSpace = 0;
+        // Once a segment has been added, a failure must remove the module's segments again
+        // so that nothing is left half loaded or half relocated.
+        bool segmentsAdded = false;
+        auto fail = [&](const char* message) {
+            errorResult = message;
+            if (segmentsAdded)
+                (void)gMem.DemoteOldPermanentSpaces(header.thisModuleId);
+            return false;
+        };
 
         // Read in and create the new segments first.  If we have problems,
         // in particular if we have run out of memory, then it's easier to recover.
         for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
         {
-            MemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleIden);
+            PermanentMemSpace* space = gMem.SpaceForIndex(descr->segmentIndex, descr->moduleIden);
             ModuleLoadData load;
             load.relocationCount = descr->relocationCount;
             load.relocRunCount = descr->relocRunCount;
@@ -2694,19 +2721,17 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             { // No data - just an entry in the index.
                 if (space == NULL)
                 {
-                    errorResult = "Required memory space is not present";
-                    return false;
+                    return fail("Required memory space is not present");
+                }
+                if (descr->segmentSize != (size_t)((char*)space->topPointer - (char*)space->bottom))
+                {
+                    return fail("Required memory space has a different size");
                 }
                 load.targetAddr = space->bottom;
                 load.moved = (uintptr_t)space->bottom != descr->originalAddr;
             }
             else
             { // New segment.
-                if (space != NULL)
-                {
-                    errorResult = "Memory space with this signature already exists";
-                    return false;
-                }
                 // Allocate memory for the new segment.
                 unsigned mFlags =
                     (descr->segmentFlags & MSF_WRITABLE ? MTF_WRITEABLE : 0) |
@@ -2725,6 +2750,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                         fileno(loadFile), descr->segmentData, mFlags, descr->segmentIndex, header.thisModuleId);
                     if (newSpace != 0)
                     {
+                        segmentsAdded = true;
                         mappedSpace = newSpace;
                         load.moved = false;
                     }
@@ -2737,20 +2763,19 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, header.thisModuleId);
                     if (newSpace == 0)
                     {
-                        errorResult = "Unable to allocate memory";
-                        return false;
+                        return fail("Unable to allocate memory");
                     }
+                    segmentsAdded = true;
                     if (fseek(loadFile, descr->segmentData, SEEK_SET) != 0)
                     {
-                        errorResult = "Unable to seek to segment";
-                        return false;
+                        return fail("Unable to seek to segment");
                     }
                     if (readData(newSpace->bottom, descr->segmentSize, loadFile) != 1)
                     {
-                        errorResult = "Unable to read segment";
-                        return false;
+                        return fail("Unable to read segment");
                     }
-                    if (newSpace->isMutable && (descr->segmentFlags & MSF_BYTES) != 0)
+                    // Set external references and clear other weak byte refs, as loading a state does.
+                    if (newSpace->noOverwrite)
                     {
                         ClearVolatile cwbr;
                         cwbr.ScanAddressesInRegion(newSpace->bottom, (PolyWord*)((byte*)newSpace->bottom + descr->segmentSize));
@@ -2770,38 +2795,39 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); anyMoved && i < loadData.end(); i++)
         {
             PolyWord* baseAddr = i->targetAddr;
+            size_t segmentSize = descrs[i - loadData.begin()].segmentSize;
             ASSERT(baseAddr != NULL); // We should have created it.
             // Process explicit relocations.
-            // If we get errors just skip the error and continue rather than leave
-            // everything in an unstable state.
             if (i->relocations)
             {
                 std::vector<ModRelocationRun> runs(i->relocRunCount);
                 if (fseek(loadFile, i->relocations, SEEK_SET) != 0 ||
                         (!runs.empty() && fread(runs.data(), sizeof(ModRelocationRun), runs.size(), loadFile) != runs.size()))
                 {
-                    errorResult = "Unable to read relocation segment";
-                    continue;
+                    return fail("Unable to read relocation segment");
                 }
                 off_t runStart = i->relocations + (off_t)(runs.size() * sizeof(ModRelocationRun));
                 std::vector<ModRelocationEntry> relocs;
                 for (std::vector<ModRelocationRun>::iterator run = runs.begin(); run < runs.end(); run++)
                 {
-                    ASSERT(run->targetSegment < header.segmentDescrCount);
+                    if (run->targetSegment >= header.segmentDescrCount)
+                        return fail("Relocation to a segment the module does not have");
                     if (i->moved || loadData[run->targetSegment].moved)
                     {
                         relocs.resize(run->count);
                         if (fseek(loadFile, runStart, SEEK_SET) != 0 ||
                                 fread(relocs.data(), sizeof(ModRelocationEntry), run->count, loadFile) != run->count)
-                            errorResult = "Unable to read relocation segment";
-                        else
+                            return fail("Unable to read relocation segment");
+                        byte* targetBase = (byte*)loadData[run->targetSegment].targetAddr;
+                        size_t targetSize = descrs[run->targetSegment].segmentSize;
+                        for (std::vector<ModRelocationEntry>::iterator reloc = relocs.begin(); reloc < relocs.end(); reloc++)
                         {
-                            byte* targetBase = (byte*)loadData[run->targetSegment].targetAddr;
-                            for (std::vector<ModRelocationEntry>::iterator reloc = relocs.begin(); reloc < relocs.end(); reloc++)
-                            {
-                                byte* setAddress = (byte*)baseAddr + reloc->relocAddress;
-                                ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetBase + reloc->targetAddress), reloc->relKind);
-                            }
+                            if (reloc->relKind > PROCESS_RELOC_C32ADDR || reloc->relocAddress > segmentSize ||
+                                    RelocationSize(reloc->relKind) > segmentSize - reloc->relocAddress ||
+                                    reloc->targetAddress > targetSize)
+                                return fail("Relocation outside its segment");
+                            byte* setAddress = (byte*)baseAddr + reloc->relocAddress;
+                            ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetBase + reloc->targetAddress), reloc->relKind);
                         }
                     }
                     runStart += (off_t)(run->count * sizeof(ModRelocationEntry));
@@ -2815,7 +2841,6 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
 
         // Get the root address.
         {
-            ASSERT(header.rootSegment < header.segmentDescrCount);
             PolyWord* baseAddr = loadData[header.rootSegment].targetAddr;
             root = (PolyObject*)((byte*)baseAddr + header.rootOffset);
         }
