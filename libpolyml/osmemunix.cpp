@@ -453,7 +453,9 @@ bool OSMemUnrestricted::FreeDataArea(void *p, size_t space)
 
 bool OSMemUnrestricted::EnableWrite(bool enable, void* p, size_t space)
 {
-    int res = mprotect(FIXTYPE p, space, enable ? PROT_READ|PROT_WRITE: PROT_READ);
+    // As in FreeDataArea: a mapped module segment need not start on a page boundary.
+    uintptr_t delta = (uintptr_t)p % pageSize;
+    int res = mprotect(FIXTYPE ((char*)p - delta), space + delta, enable ? PROT_READ|PROT_WRITE: PROT_READ);
     return res != -1;
 }
 

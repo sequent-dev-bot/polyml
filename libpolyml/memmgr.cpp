@@ -628,6 +628,18 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
         else
         {
             try {
+#ifdef POLYML_MAP_SAVED_STATES
+                // A module segment mapped from its file is write-protected once relocated.
+                // Make it writable first, so that the space is left as it was if that fails.
+                if (pSpace->isWriteProtected && !pSpace->isCode)
+                {
+                    uintptr_t delta = (uintptr_t)pSpace->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
+                    if (mprotect((char*)pSpace->bottom - delta, (char*)pSpace->top - (char*)pSpace->bottom + delta,
+                            PROT_READ|PROT_WRITE) != 0)
+                        return false;
+                    pSpace->isWriteProtected = false;
+                }
+#endif
                 // Turn this into a local space or a code space
                 // Remove this from the tree - AddLocalSpace will make an entry for the local version.
                 RemoveTree(pSpace);
@@ -679,17 +691,6 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                 }
                 else
                 {
-#ifdef POLYML_MAP_SAVED_STATES
-                    // A module segment mapped from its file is write-protected once relocated.
-                    if (pSpace->isWriteProtected)
-                    {
-                        uintptr_t delta = (uintptr_t)pSpace->bottom % (uintptr_t)sysconf(_SC_PAGESIZE);
-                        if (mprotect((char*)pSpace->bottom - delta, (char*)pSpace->top - (char*)pSpace->bottom + delta,
-                                PROT_READ|PROT_WRITE) != 0)
-                            return false;
-                        pSpace->isWriteProtected = false;
-                    }
-#endif
                     // Enable write access.  Permanent spaces are read-only.
 //                    osHeapAlloc.SetPermissions(pSpace->bottom, (char*)pSpace->top - (char*)pSpace->bottom,
 //                        PERMISSION_READ | PERMISSION_WRITE);
