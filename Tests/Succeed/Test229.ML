@@ -60,7 +60,7 @@ val saveWithModules =
     "val () = PolyML.SaveState.saveChildWithModules (" ^ quoted "state" ^ ", 0);\n\
     \val deps = PolyML.SaveState.showModuleDependencies " ^ quoted "state" ^ ";\n\
     \val () = if List.map #1 deps = PolyML.SaveState.showLoadedModules () then () else raise Fail \"dependency ids\";\n\
-    \val () = if List.map #2 deps = [" ^ quoted "A.pmo" ^ ", " ^ quoted "B.pmo" ^ "] then () else raise Fail \"dependency paths\";\n" ^
+    \val () = if List.map #2 deps = List.map OS.FileSys.realPath [" ^ quoted "A.pmo" ^ ", " ^ quoted "B.pmo" ^ "] then () else raise Fail \"dependency paths\";\n" ^
     checkAB ^
     "val () = PolyML.SaveState.saveState " ^ quoted "plain" ^ ";\n\
     \val () = if PolyML.SaveState.showModuleDependencies " ^ quoted "plain" ^ " = [] then () else raise Fail \"plain dependencies\";\n\

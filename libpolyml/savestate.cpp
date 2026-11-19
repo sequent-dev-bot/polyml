@@ -2232,6 +2232,8 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             char* start = (char*)entry->mtOriginalAddr;
             char* end = start + entry->mtLength;
             std::vector<byte> zeroed((byte*)start, (byte*)end);
+            // The byte ranges of data a load resets, in order.
+            std::vector<std::pair<size_t, size_t> > volatileRanges;
             for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
             {
                 p++;
@@ -2249,6 +2251,8 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                         (length >= sizeof(uintptr_t) / sizeof(PolyWord) ? sizeof(uintptr_t) : 0) :
                         obj->IsByteObject() ? 0 : length * sizeof(PolyWord);
                     memset(zeroed.data() + offset, 0, bytes);
+                    if (bytes != 0)
+                        volatileRanges.push_back(std::make_pair(offset, offset + bytes));
                 }
                 p += length;
             }
@@ -2257,6 +2261,12 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             {
                 ASSERT(r->relocAddress + RelocationSize(r->relKind) <= entry->mtLength);
                 ZeroRelocatedBits(zeroed.data() + r->relocAddress, r->relKind);
+                // A relocation in data a load resets doesn't affect the loaded module.
+                std::vector<std::pair<size_t, size_t> >::const_iterator v =
+                    std::upper_bound(volatileRanges.cbegin(), volatileRanges.cend(),
+                        std::make_pair((size_t)r->relocAddress, ~(size_t)0));
+                if (v != volatileRanges.cbegin() && (size_t)r->relocAddress < (v - 1)->second)
+                    continue;
                 const ExportMemTable* target = &this->memTable[r->targetSegment];
                 idHash.addWord(r->relocAddress);
                 idHash.addWord(r->targetSegment < newAreas ? ModuleKey(target->mtModId) : 0);
@@ -2421,7 +2431,12 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         }
 
         // Rewrite the header and the segment tables now they're complete.
-        fseek(exportFile, 0, SEEK_SET);
+        if (fseek(exportFile, 0, SEEK_SET) != 0)
+        {
+            errNumber = ERRORNUMBER;
+            errorMessage = "Error while writing module";
+            throw IOException();
+        }
         if (!checkedFwrite(&modHeader, sizeof(modHeader), 1))
             throw IOException();
         if (!checkedFwrite(descrs.data(), sizeof(ModuleSegmentDescr), this->memTableEntries))
