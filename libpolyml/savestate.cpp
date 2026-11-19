@@ -2460,29 +2460,30 @@ void ModuleExporter::Perform()
             char *existing = realpath(fileName, NULL); // NULL if there's no file yet.
             publishName = existing != NULL ? existing : fileName;
             free(existing);
+            // Created with the old file's permissions, or as a new file is, less the umask.
+            // Not set with fchmod afterwards: sandboxes may forbid it.
             struct stat oldStat;
-            mode_t mode;
-            if (stat(publishName.c_str(), &oldStat) == 0)
-                mode = oldStat.st_mode & 0777;
-            else
+            mode_t mode = stat(publishName.c_str(), &oldStat) == 0 ? (oldStat.st_mode & 0777) : 0666;
+            static unsigned long sequence = 0;
+            int fd = -1;
+            for (unsigned attempt = 0; fd < 0 && attempt < 100; attempt++)
             {
-                mode_t mask = umask(0);
-                umask(mask);
-                mode = 0666 & ~mask;
+                tempName = publishName + "." + std::to_string((long)getpid()) + "." + std::to_string(sequence++);
+                fd = open(tempName.c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
+                if (fd < 0 && errno != EEXIST)
+                    break;
             }
-            std::string pattern = publishName + ".XXXXXX";
-            std::vector<char> temp(pattern.begin(), pattern.end());
-            temp.push_back(0);
-            int fd = mkstemp(temp.data());
-            if (fd >= 0)
+            if (fd < 0)
             {
-                tempName = temp.data();
-                if (fchmod(fd, mode) != 0 || (exportFile = fdopen(fd, "wb")) == NULL)
-                {
-                    int err = errno;
-                    close(fd);
-                    errno = err;
-                }
+                int err = errno;
+                tempName.clear();
+                errno = err;
+            }
+            else if ((exportFile = fdopen(fd, "wb")) == NULL)
+            {
+                int err = errno;
+                close(fd);
+                errno = err;
             }
         }
 #endif
