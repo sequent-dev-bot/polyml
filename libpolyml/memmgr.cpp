@@ -648,9 +648,9 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                     pSpace->isWriteProtected = false;
                 }
 #endif
-                // Turn this into a local space or a code space
-                // Remove this from the tree - AddLocalSpace will make an entry for the local version.
-                RemoveTree(pSpace);
+                // Turn this into a local space or a code space.  The new space replaces this
+                // one in the tree; if adding it fails this one goes back, so a failure leaves
+                // the space as it was.
 
                 if (pSpace->isCode)
                 {
@@ -662,12 +662,18 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                     {
                         if (debugOptions & DEBUG_MEMMGR)
                             Log("MMGR: Unable to create header map for state space %p\n", pSpace);
+                        space->bottom = 0; // The memory is still the permanent space's.
+                        delete space;
                         return false;
                     }
+                    RemoveTree(pSpace);
                     if (!AddCodeSpace(space))
                     {
                         if (debugOptions & DEBUG_MEMMGR)
                             Log("MMGR: Unable to convert saved state space %p into code space\n", pSpace);
+                        space->bottom = 0; // The memory is still the permanent space's.
+                        delete space;
+                        AddTree(pSpace);
                         return false;
                     }
                     if (debugOptions & DEBUG_MEMMGR)
@@ -710,10 +716,22 @@ bool MemMgr::DemoteOldPermanentSpaces(ModuleId modId)
                         space->fullGCLowerLimit = pSpace->bottom;
                     space->isMutable = pSpace->isMutable;
                     space->isCode = false;
-                    if (!space->bitmap.Create(space->top - space->bottom) || !AddLocalSpace(space))
+                    if (!space->bitmap.Create(space->top - space->bottom))
                     {
                         if (debugOptions & DEBUG_MEMMGR)
                             Log("MMGR: Unable to convert saved state space %p into local space\n", pSpace);
+                        space->bottom = 0; // The memory is still the permanent space's.
+                        delete space;
+                        return false;
+                    }
+                    RemoveTree(pSpace);
+                    if (!AddLocalSpace(space))
+                    {
+                        if (debugOptions & DEBUG_MEMMGR)
+                            Log("MMGR: Unable to convert saved state space %p into local space\n", pSpace);
+                        space->bottom = 0; // The memory is still the permanent space's.
+                        delete space;
+                        AddTree(pSpace);
                         return false;
                     }
 

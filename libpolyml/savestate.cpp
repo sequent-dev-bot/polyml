@@ -596,6 +596,16 @@ void SaveRequest::Perform()
                 return;
             }
         }
+        // Nor a loaded module's file, which the state may depend on.
+        for (std::vector<LoadedModuleData>::const_iterator m = loadedModules.cbegin(); m != loadedModules.cend(); m++)
+        {
+            if (!m->fileName.empty() && sameFile(m->fileName.c_str(), fileName))
+            {
+                errorMessage = "File being saved is a loaded module";
+                errNumber = 0;
+                return;
+            }
+        }
 
 #ifdef POLYML_MAP_SAVED_STATES
         // Other processes may have the existing file mapped: write a new file rather
@@ -2069,7 +2079,13 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                     {
                         if (!copyScan.dependencies[k->modId])
                         {
-                            ModIdAndName m(_T(""), k->modId, true);
+                            // A module exported over a saved state records the state's level, which
+                            // the loop below expands with its parents and recorded modules.
+                            bool isLevel = false;
+                            for (std::vector<HierarchyTable>::const_iterator h = hierarchyTable.cbegin(); h != hierarchyTable.cend(); h++)
+                                if (*k == ModuleId(h->timeStamp))
+                                    isLevel = true;
+                            ModIdAndName m(_T(""), k->modId, !isLevel);
                             // Add this to the end.  It will be processed later but the sub-dependencies should already be there.
                             dependencies.push_back(m);
                             copyScan.dependencies[k->modId] = true; // Don't need to add it again.
@@ -2271,6 +2287,13 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         for (std::vector<PermanentMemSpace*>::iterator i = gMem.eSpaces.begin(); i < gMem.eSpaces.end(); i++)
             (*i)->moduleIdentifier = ModuleId(exportModId);
         modHeader.thisModuleId = exportModId;
+        // A module with the same content that is already loaded has this id, and exports
+        // naming the id refer to its data, not to these objects: refuse to export them.
+        if (loadedModuleIds.count(ModuleKey(exportModId)) != 0)
+        {
+            errorMessage = "A module with the same contents is already loaded";
+            throw IOException();
+        }
         modHeader.segmentDescrCount = this->memTableEntries; // One segment for each space.
         // Write out the header.
         if (!checkedFwrite(&modHeader, sizeof(modHeader), 1))
@@ -2421,14 +2444,6 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         }
         tempName.clear();
 #endif
-
-        // A module with the same content is already loaded: its segments have this id,
-        // so these ones stay local data.
-        if (loadedModuleIds.count(ModuleKey(exportModId)) != 0)
-        {
-            CopyScan::revertToLocal();
-            return;
-        }
 
         // Add this to the loaded module table.
         LoadedModuleData loadMod;
