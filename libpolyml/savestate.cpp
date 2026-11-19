@@ -677,10 +677,9 @@ void SaveRequest::Perform()
                     moduleTable.push_back(&*m);
             }
         }
-        copyScan.initialise();
-
         bool success = true;
         try {
+            copyScan.initialise();
             for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
             {
                 PermanentMemSpace* space = *i;
@@ -1908,7 +1907,7 @@ protected:
     void createActualRelocation(void* addr, void* relocAddr, ScanRelocationKind kind);
     unsigned relocationCount;
     std::vector<ModRelocationEntry> relocations; // For the segment being written.
-#ifdef POLYML_MAP_SAVED_STATES
+#ifndef _WIN32
     // The module is written to tempName and renamed to publishName when it is complete.
     std::string publishName, tempName;
 #endif
@@ -1954,6 +1953,29 @@ static size_t RelocationSize(ScanRelocationKind kind)
     case PROCESS_RELOC_DIRECT: return sizeof(uintptr_t);
     case PROCESS_RELOC_I386RELATIVE: case PROCESS_RELOC_C32ADDR: return 4;
     default: return 8; // An ARM64 instruction pair.
+    }
+}
+
+// Zero the bits a relocation of this kind sets, which depend on where things are in
+// memory, and keep the rest: in an ARM64 instruction pair, the opcodes and registers.
+static void ZeroRelocatedBits(byte* p, ScanRelocationKind kind)
+{
+    switch (kind)
+    {
+    case PROCESS_RELOC_ARM64ADRPLDR64:
+    case PROCESS_RELOC_ARM64ADRPLDR32:
+    case PROCESS_RELOC_ARM64ADRPADD:
+    {
+        // As ScanAddress::SetConstantValue sets them.
+        uint32_t instr[2];
+        memcpy(instr, p, sizeof(instr));
+        instr[0] = toARMInstr(fromARMInstr(instr[0]) & 0x9f00001f);
+        instr[1] = toARMInstr(fromARMInstr(instr[1]) & 0xffc003ff);
+        memcpy(p, instr, sizeof(instr));
+        break;
+    }
+    default:
+        memset(p, 0, RelocationSize(kind));
     }
 }
 
@@ -2203,7 +2225,7 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
             {
                 ASSERT(r->relocAddress + RelocationSize(r->relKind) <= entry->mtLength);
-                memset(zeroed.data() + r->relocAddress, 0, RelocationSize(r->relKind));
+                ZeroRelocatedBits(zeroed.data() + r->relocAddress, r->relKind);
                 const ExportMemTable* target = &this->memTable[r->targetSegment];
                 idHash.addWord(r->relocAddress);
                 idHash.addWord(r->targetSegment < newAreas ? ModuleKey(target->mtModId) : 0);
@@ -2731,13 +2753,20 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             errorResult = "Module root is outside its segment";
             return false;
         }
-        // The module's own segments must not be present yet: a failed load removes the
-        // segments with the module's id, which must be only those it added.
+        // No space may have the module's id yet: a failed load removes the spaces with the
+        // module's id, which must be only those it added.
+        for (std::vector<PermanentMemSpace*>::iterator sp = gMem.pSpaces.begin(); sp < gMem.pSpaces.end(); sp++)
+        {
+            if ((*sp)->moduleIdentifier == ModuleId(header.thisModuleId))
+            {
+                errorResult = "Memory space with this signature already exists";
+                return false;
+            }
+        }
         for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
         {
             if (descr->segmentData != 0 &&
-                (ModuleId(descr->moduleIden) != ModuleId(header.thisModuleId) ||
-                    gMem.SpaceForIndex(descr->segmentIndex, header.thisModuleId) != NULL))
+                ModuleId(descr->moduleIden) != ModuleId(header.thisModuleId))
             {
                 errorResult = "Memory space with this signature already exists";
                 return false;
@@ -2754,6 +2783,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
 #endif
         PermanentMemSpace* mappedSpace = 0;
+        std::vector<PermanentMemSpace*> volatileSpaces; // Read-in no-overwrite segments.
         // Once a segment has been added, a failure, an exception included, must remove the
         // module's segments again so that nothing is left half loaded or half relocated.
         // Only this load's segments have the module's id: that was checked above.
@@ -2839,12 +2869,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     {
                         return fail("Unable to read segment");
                     }
-                    // Set external references and clear other weak byte refs, as loading a state does.
                     if (newSpace->noOverwrite)
-                    {
-                        ClearVolatile cwbr;
-                        cwbr.ScanAddressesInRegion(newSpace->bottom, (PolyWord*)((byte*)newSpace->bottom + descr->segmentSize));
-                    }
+                        volatileSpaces.push_back(newSpace);
                 }
                 load.targetAddr = newSpace->bottom;
             }
@@ -2898,6 +2924,14 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     runStart += (off_t)(run->count * sizeof(ModRelocationEntry));
                 }
             }
+        }
+        // Set external references and clear other weak byte refs, as loading a state does.
+        // After relocation, which would otherwise set the pointers it clears again when a
+        // segment moved.
+        for (std::vector<PermanentMemSpace*>::iterator v = volatileSpaces.begin(); v < volatileSpaces.end(); v++)
+        {
+            ClearVolatile cwbr;
+            cwbr.ScanAddressesInRegion((*v)->bottom, (*v)->topPointer);
         }
 #ifdef POLYML_MAP_SAVED_STATES
         if (mappedSpace != 0)
