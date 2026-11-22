@@ -2347,9 +2347,47 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         unsigned immutableSegments = 0;
         for (unsigned k = newAreas; k < this->memTableEntries; k++)
             if (this->memTable[k].mtFlags == 0) immutableSegments++;
+        // Prototype: a module's immutable byte segment, when it has one, is prelinked
+        // too (unless POLY_MAP_BYTES=0 when the module is written), so that it can be
+        // mapped from the file and the other segments' pointers into it need no
+        // relocation.  Each prelinked segment's address is a fixed distance from its
+        // file offset, so the segments don't overlap and each can be mapped.
+        const char* mapBytesEnv = getenv("POLY_MAP_BYTES");
+        bool mapBytes = mapBytesEnv == 0 || strcmp(mapBytesEnv, "0") != 0;
+        unsigned immutableByteSegments = 0;
+        for (unsigned k = newAreas; k < this->memTableEntries; k++)
+            if (this->memTable[k].mtFlags == MTF_BYTES) immutableByteSegments++;
+        std::vector<bool> prelinked(this->memTableEntries, false);
+        std::vector<uint64_t> segOffset(this->memTableEntries, 0);
+        uintptr_t prelinkBase = 0;
+        bool havePrelinkBase = false;
+        {
+            uint64_t off = (uint64_t)ftell(this->exportFile);
+            for (unsigned k = newAreas; k < this->memTableEntries; k++)
+            {
+                std::vector<ModRelocationEntry>& rs = segmentRelocations[k];
+                bool p = (immutableSegments == 1 && this->memTable[k].mtFlags == 0) ||
+                    (mapBytes && immutableByteSegments == 1 && this->memTable[k].mtFlags == MTF_BYTES);
+                size_t runCount = 0;
+                for (size_t r = 0; r < rs.size(); r++)
+                {
+                    if (r == 0 || rs[r].targetSegment != rs[r - 1].targetSegment) runCount++;
+                    if (rs[r].relKind != PROCESS_RELOC_DIRECT) p = false;
+                }
+                segOffset[k] = off;
+                prelinked[k] = p;
+                if (p && !havePrelinkBase)
+                {
+                    prelinkBase = ModulePrelinkAddress(exportModId, off) - (uintptr_t)off;
+                    havePrelinkBase = true;
+                }
+                off += this->memTable[k].mtLength + runCount * sizeof(ModRelocationRun) +
+                    rs.size() * sizeof(ModRelocationEntry);
+            }
+        }
         for (unsigned k = newAreas; k < this->memTableEntries; k++)
         {
-            bool prelink = immutableSegments == 1 && this->memTable[k].mtFlags == 0;
+            bool prelink = prelinked[k];
             ModuleSegmentDescr* thisDescr = &descrs[k];
             ExportMemTable* entry = &this->memTable[k];
             char* start = (char*)entry->mtOriginalAddr;
@@ -2364,8 +2402,6 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
                     runs.push_back(run);
                 }
                 runs.back().count++;
-                if (r->relKind != PROCESS_RELOC_DIRECT)
-                    prelink = false;
             }
             thisDescr->relocationCount = (unsigned)this->relocations.size();
             thisDescr->relocRunCount = (unsigned)runs.size();
@@ -2374,11 +2410,13 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
             thisDescr->segmentData = ftell(exportFile);
             if (prelink)
             {
-                uintptr_t prelinkAddr = ModulePrelinkAddress(exportModId, (uint64_t)thisDescr->segmentData);
+                ASSERT((uint64_t)thisDescr->segmentData == segOffset[k]);
+                uintptr_t prelinkAddr = prelinkBase + (uintptr_t)segOffset[k];
                 std::vector<byte> staging((byte*)start, (byte*)end);
                 for (std::vector<ModRelocationEntry>::iterator r = this->relocations.begin(); r < this->relocations.end(); r++)
                 {
-                    uintptr_t base = r->targetSegment == k ? prelinkAddr : (uintptr_t)this->memTable[r->targetSegment].mtOriginalAddr;
+                    uintptr_t base = prelinked[r->targetSegment] ? prelinkBase + (uintptr_t)segOffset[r->targetSegment]
+                        : (uintptr_t)this->memTable[r->targetSegment].mtOriginalAddr;
                     storeAddress(staging.data() + r->relocAddress, base + r->targetAddress);
                 }
                 thisDescr->originalAddr = prelinkAddr;
@@ -2832,13 +2870,10 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         }
         // No space may have the module's id yet: a failed load removes the spaces with the
         // module's id, which must be only those it added.
-        for (std::vector<PermanentMemSpace*>::iterator sp = gMem.pSpaces.begin(); sp < gMem.pSpaces.end(); sp++)
+        if (gMem.HasModuleSpaces(ModuleId(header.thisModuleId)))
         {
-            if ((*sp)->moduleIdentifier == ModuleId(header.thisModuleId))
-            {
-                errorResult = "Memory space with this signature already exists";
-                return false;
-            }
+            errorResult = "Memory space with this signature already exists";
+            return false;
         }
         for (std::vector<ModuleSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
         {
@@ -2859,7 +2894,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         struct stat fileStat;
         uint64_t fileSize = fstat(fileno(loadFile), &fileStat) == 0 ? (uint64_t)fileStat.st_size : 0;
 #endif
-        PermanentMemSpace* mappedSpace = 0;
+        std::vector<PermanentMemSpace*> mappedSpaces; // Mapped from the file, write-protected once relocated.
         std::vector<PermanentMemSpace*> volatileSpaces; // Read-in no-overwrite segments.
         // Once a segment has been added, a failure, an exception included, must remove the
         // module's segments again so that nothing is left half loaded or half relocated.
@@ -2923,7 +2958,7 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
                     if (newSpace != 0)
                     {
                         addedSegments.added = true;
-                        mappedSpace = newSpace;
+                        mappedSpaces.push_back(newSpace);
                         load.moved = false;
                     }
                 }
@@ -3011,8 +3046,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
             cwbr.ScanAddressesInRegion((*v)->bottom, (*v)->topPointer);
         }
 #ifdef POLYML_MAP_SAVED_STATES
-        if (mappedSpace != 0)
-            gMem.WriteProtectMappedSpace(mappedSpace);
+        for (std::vector<PermanentMemSpace*>::iterator m = mappedSpaces.begin(); m < mappedSpaces.end(); m++)
+            gMem.WriteProtectMappedSpace(*m);
 #endif
 
         // Get the root address.

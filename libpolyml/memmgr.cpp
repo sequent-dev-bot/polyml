@@ -869,17 +869,35 @@ void MemMgr::AddPermanentSpace(PermanentMemSpace *space)
     if (!spaceIndexComplete) return;
     try {
         spaceIndex.emplace(KeyFor(space), space);
+        moduleSpaceCount[ModKey(space->moduleIdentifier)]++;
     }
     catch (std::bad_alloc&) {
         spaceIndexComplete = false;
         spaceIndex.clear();
+        moduleSpaceCount.clear();
     }
+}
+
+// Whether any space in pSpaces has this module id: by the count kept with the index,
+// or by searching pSpaces once the index is given up.
+bool MemMgr::HasModuleSpaces(ModuleId modId)
+{
+    if (!spaceIndexComplete)
+    {
+        for (std::vector<PermanentMemSpace*>::iterator i = pSpaces.begin(); i < pSpaces.end(); i++)
+            if ((*i)->moduleIdentifier == modId) return true;
+        return false;
+    }
+    return moduleSpaceCount.find(ModKey(modId)) != moduleSpaceCount.end();
 }
 
 // Called before a space is removed from pSpaces.
 void MemMgr::RemoveFromSpaceIndex(PermanentMemSpace *space)
 {
     if (!spaceIndexComplete) return;
+    std::unordered_map<uint64_t, unsigned>::iterator c = moduleSpaceCount.find(ModKey(space->moduleIdentifier));
+    if (c != moduleSpaceCount.end() && --c->second == 0)
+        moduleSpaceCount.erase(c);
     SpaceKey k = KeyFor(space);
     std::unordered_map<SpaceKey, PermanentMemSpace*, SpaceKeyHash>::iterator f = spaceIndex.find(k);
     if (f == spaceIndex.end() || f->second != space)
@@ -895,6 +913,7 @@ void MemMgr::RemoveFromSpaceIndex(PermanentMemSpace *space)
             catch (std::bad_alloc&) {
                 spaceIndexComplete = false;
                 spaceIndex.clear();
+                moduleSpaceCount.clear();
             }
             break;
         }

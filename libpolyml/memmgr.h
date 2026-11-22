@@ -375,9 +375,14 @@ private:
     bool spaceIndexComplete;
     static SpaceKey KeyFor(PermanentMemSpace *space)
     { struct _moduleId m = space->moduleIdentifier; SpaceKey k = { m.modA, m.modB, space->index }; return k; }
+    // Number of spaces in pSpaces with each module id, kept with spaceIndex.
+    std::unordered_map<uint64_t, unsigned> moduleSpaceCount;
+    static uint64_t ModKey(ModuleId modId)
+    { struct _moduleId m = modId; return (uint64_t)m.modA << 32 | m.modB; }
     void AddPermanentSpace(PermanentMemSpace *space);
     void RemoveFromSpaceIndex(PermanentMemSpace *space);
 public:
+    bool HasModuleSpaces(ModuleId modId); // Whether a space in pSpaces has this module id.
 
     // As a debugging check, write protect the immutable areas apart from during the GC.
     void ProtectImmutable(bool on);
