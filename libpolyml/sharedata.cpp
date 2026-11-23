@@ -965,6 +965,11 @@ bool ShareDataClass::RunShareData(PolyObject *root)
         // That will also do any clean-up.
         success = false;
     }
+    catch (std::bad_alloc &)
+    {
+        // Listing the roots ran out of memory.
+        success = false;
+    }
 
     ProcessFixupAddress fixup;
 
