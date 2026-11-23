@@ -175,7 +175,6 @@ public:
     // This area grows upwards unlike the local areas that grow down.
     PolyWord    *topPointer;
 
-    Bitmap      shareBitmap; // Used in sharedata
     Bitmap      profileCode; // Used when profiling
     // While CopyScan runs: where the tombstones for this write-protected space are, if any.
     PolyWord    *copyGraves;

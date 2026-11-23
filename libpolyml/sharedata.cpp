@@ -229,10 +229,6 @@ ShareDataClass::ShareDataClass()
 
 ShareDataClass::~ShareDataClass()
 {
-    // Free the bitmaps associated with the permanent spaces.
-    for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
-       (*i)->shareBitmap.Destroy();
-
     // Free the depth vectors.
     for (unsigned i = 0; i < FIXEDLENGTHSIZE; i++)
     {
@@ -737,25 +733,13 @@ POLYUNSIGNED ProcessAddToVector::AddObjectToDepthVector(PolyObject *obj)
         return 0; // Level is zero
     }
 
-    if (space->spaceType == ST_PERMANENT && ((PermanentMemSpace*)space)->isWriteProtected)
-    {
-        // Immutable data in the permanent area can't be merged
-        // because it's read only.  We need to follow the addresses
-        // because they may point to mutable areas containing data
-        // that can be.  A typical case is the root function pointing
-        // at the global name table containing new declarations.
-        // Indexed by the object's length word: an object of length zero at the
-        // top of the space starts at the top, one past the bitmap.
-        Bitmap *bm = &((PermanentMemSpace*)space)->shareBitmap;
-        uintptr_t bit = ((PolyWord*)obj - 1) - space->bottom;
-        if (! bm->TestBit(bit))
-        {
-            bm->SetBit(bit);
-            if (! obj->IsByteObject())
-                PushToStack(obj);
-        }
+    // Immutable data in a permanent space (the executable, a loaded saved
+    // state or a module) is never merged or followed.  Merging into it would
+    // let permanent data point at local data, and it can't point at local data
+    // itself: only mutable permanent objects are written after the space was
+    // made, and RunShareData scans those.
+    if (space->spaceType == ST_PERMANENT && !((PermanentMemSpace*)space)->isMutable)
         return 0;
-    }
 
     /* There's a problem sharing code objects if they have relative calls/jumps
        in them to other code.  The code of two functions may be identical (e.g.
@@ -921,18 +905,6 @@ void ProcessAddToVector::ProcessRoot(PolyObject *root)
 // This is called by the root thread to do the work.
 bool ShareDataClass::RunShareData(PolyObject *root)
 {
-    // We use a bitmap to indicate when we've visited an object to avoid
-    // infinite recursion in cycles in the data.
-    for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
-    {
-        PermanentMemSpace *space = *i;
-        if (space->isWriteProtected)
-        {
-            if (! space->shareBitmap.Create(space->spaceSize()))
-                return false;
-        }
-    }
-
     POLYUNSIGNED totalObjects = 0;
     POLYUNSIGNED totalShared  = 0;
 
@@ -940,13 +912,62 @@ bool ShareDataClass::RunShareData(PolyObject *root)
     bool success = true;
 
     try {
+        // Immutable permanent data isn't followed, so a root there (the usual
+        // PolyML.rootFunction) reaches nothing by itself.  Then the roots are
+        // the objects that can point at local data: the mutable word objects
+        // of the permanent spaces and the code in the code spaces, listed
+        // before the scan replaces their length words.  A local root keeps
+        // its meaning: only what it reaches is shared.
+        std::vector<PolyObject*> roots;
+        MemSpace *rootSpace = gMem.SpaceForObjectAddress(root);
+        if (rootSpace != 0 && rootSpace->spaceType == ST_PERMANENT && !((PermanentMemSpace*)rootSpace)->isMutable)
+        {
+            for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
+            {
+                PermanentMemSpace *space = *i;
+                if (!space->isMutable || space->byteOnly)
+                    continue;
+                for (PolyWord *pt = space->bottom; pt < space->top; )
+                {
+                    pt++;
+                    PolyObject *obj = (PolyObject*)pt;
+                    POLYUNSIGNED L = obj->LengthWord();
+                    ASSERT(OBJ_IS_LENGTH(L));
+                    if (obj->IsMutable() && obj->IsWordObject())
+                        roots.push_back(obj);
+                    pt += OBJ_OBJECT_LENGTH(L);
+                }
+            }
+            // Free space in a code space is a byte object.
+            for (std::vector<CodeSpace*>::iterator i = gMem.cSpaces.begin(); i < gMem.cSpaces.end(); i++)
+            {
+                CodeSpace *space = *i;
+                for (PolyWord *pt = space->bottom; pt < space->top; )
+                {
+                    pt++;
+                    PolyObject *obj = (PolyObject*)pt;
+                    POLYUNSIGNED L = obj->LengthWord();
+                    ASSERT(OBJ_IS_LENGTH(L));
+                    if (obj->IsCodeObject())
+                        roots.push_back(obj);
+                    pt += OBJ_OBJECT_LENGTH(L);
+                }
+            }
+        }
         ProcessAddToVector addToVector(this);
         addToVector.ProcessRoot(root);
+        for (std::vector<PolyObject*>::iterator i = roots.begin(); i < roots.end(); i++)
+            addToVector.ProcessRoot(*i);
     }
     catch (MemoryException &)
     {
         // If we ran out of memory we may still be able to process what we have.
         // That will also do any clean-up.
+        success = false;
+    }
+    catch (std::bad_alloc &)
+    {
+        // Listing the roots ran out of memory.
         success = false;
     }
 
