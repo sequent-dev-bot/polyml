@@ -60,7 +60,7 @@ bool OSMem::Initialise(enum _MemUsage usage)
     return true;
 }
 
-bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space /* = 0 */, void** pBase /* = 0 */)
+bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space, void** pBase, void* /* preferredBase: unused */)
 {
     if (!OSMem::Initialise(usage))
         return false;

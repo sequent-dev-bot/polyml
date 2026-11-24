@@ -127,18 +127,25 @@ class OSMemInRegion: public OSMem {
 public:
     OSMemInRegion() {
         memBase = shadowBase = 0;
+        regionPages = 0;
     }
 
-    bool Initialise(enum _MemUsage usage, size_t space, void** pBase);
+    // If preferredBase is non-zero the region is placed there if that address is free.
+    bool Initialise(enum _MemUsage usage, size_t space, void** pBase, void* preferredBase = 0);
     virtual void* AllocateDataArea(size_t& bytes);
     virtual bool FreeDataArea(void* p, size_t space);
     virtual bool EnableWrite(bool enable, void* p, size_t space);
     virtual void* AllocateCodeArea(size_t& bytes, void*& shadowArea);
     virtual bool FreeCodeArea(void* codeAddr, void* dataAddr, size_t space);
     virtual bool DisableWriteForCode(void* codeAddr, void* dataAddr, size_t space);
+    // Allocate code at the lowest 64K-aligned free address at or above low.  Returns 0
+    // if there is none.  Unix only.
+    void* AllocateCodeAreaAbove(size_t& bytes, void*& shadowArea, void* low);
 
 protected:
+    void* MapCodeArea(uintptr_t offset, size_t space, void*& shadowArea);
     Bitmap pageMap;
+    uintptr_t regionPages;
     uintptr_t lastAllocated;
     char* memBase, * shadowBase;
     PLock bitmapLock;

@@ -35,6 +35,12 @@
 #if (defined(__linux__) && defined(__LP64__) && !defined(POLYML32IN64))
 #define POLYML_MAP_SAVED_STATES 1
 #endif
+// Saved-state code segments are allocated bottom-up in the code area, which is reserved at
+// a fixed address, and are loaded at the addresses they were saved at.  Data that points
+// only into segments that are where they were saved needs no relocation.
+#if (defined(POLYML_MAP_SAVED_STATES) && (defined(HOSTARCHITECTURE_X86_64) || defined(HOSTARCHITECTURE_AARCH64)))
+#define POLYML_PLACE_SAVED_CODE 1
+#endif
 
 // utility conversion macros
 #define Words_to_K(w) (w*sizeof(PolyWord))/1024
@@ -297,7 +303,9 @@ public:
 
     // Create a permanent space but allocate memory for it.
     // Sets bottom and top to the actual memory size.
-    PermanentMemSpace *AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule);
+    // A code space is put at codeAddr, or as near above it as possible, if codeAddr is non-zero.
+    PermanentMemSpace *AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule,
+        void *codeAddr = 0);
     // Called after an allocated permanent area has been filled in.
     bool CompletePermanentSpaceAllocation(PermanentMemSpace *space);
 #ifdef POLYML_MAP_SAVED_STATES
@@ -359,6 +367,12 @@ public:
 #ifdef POLYML_MAP_SAVED_STATES
 private:
     void *AllocateInStateRegion(size_t &space);
+public:
+#endif
+#ifdef POLYML_PLACE_SAVED_CODE
+private:
+    void *SavedCodeFloor();
+    char *codeAreaBase, *codeAreaTop;
 public:
 #endif
 
