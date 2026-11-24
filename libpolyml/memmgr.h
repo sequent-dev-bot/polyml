@@ -370,9 +370,11 @@ private:
 public:
 #endif
 #ifdef POLYML_PLACE_SAVED_CODE
+    // While a state at this depth (1 = top) is being saved its code goes in the depth's
+    // slot of the code area; 0 when no state is being saved.
+    void SetSavedCodeDepth(unsigned depth);
 private:
-    void *SavedCodeFloor();
-    char *codeAreaBase, *codeAreaTop;
+    char *codeAreaBase, *savedCodeFloor;
 public:
 #endif
 

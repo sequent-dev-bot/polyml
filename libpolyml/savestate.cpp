@@ -733,6 +733,9 @@ void SaveRequest::Perform()
         }
         bool success = true;
         PhaseClock clock;
+#ifdef POLYML_PLACE_SAVED_CODE
+        gMem.SetSavedCodeDepth(newHierarchy);
+#endif
         try {
             copyScan.initialise();
             // By index: making an export space reserves pSpaces capacity, which may move it.
@@ -758,6 +761,9 @@ void SaveRequest::Perform()
             if (debugOptions & DEBUG_SAVING)
                 Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
         }
+#ifdef POLYML_PLACE_SAVED_CODE
+        gMem.SetSavedCodeDepth(0);
+#endif
 
         // Copy the areas into the export object.  Make sufficient space for
         // the largest possible number of entries.

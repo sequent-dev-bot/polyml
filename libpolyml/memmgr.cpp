@@ -208,7 +208,7 @@ bool MemMgr::Initialise()
         return false;
 #ifdef POLYML_PLACE_SAVED_CODE
     codeAreaBase = (char*)codeBase;
-    codeAreaTop = codeAreaBase + (size_t)2 * 1024 * 1024 * 1024;
+    savedCodeFloor = 0;
 #endif
 #ifdef POLYML32IN64
     globalCodeBase = (PolyWord*)codeBase;
@@ -519,21 +519,12 @@ void *MemMgr::AllocateInStateRegion(size_t &space)
 #endif
 
 #ifdef POLYML_PLACE_SAVED_CODE
-// The address above which a new saved code segment goes: above the code segments of the
-// states and modules loaded and being saved, so that a child's code lies above its parents'.
-// Transient code is allocated from the top of the code area down.
-void *MemMgr::SavedCodeFloor()
+// Code saved at depth d goes at the lowest free address at or above (d-1)*64M in the
+// code area, so a child's code doesn't collide with its parents' and is placed the same
+// whichever process saves it.  Transient code is allocated from the top down.
+void MemMgr::SetSavedCodeDepth(unsigned depth)
 {
-    char *next = codeAreaBase;
-    std::vector<PermanentMemSpace*> spaces(pSpaces.begin(), pSpaces.end());
-    spaces.insert(spaces.end(), eSpaces.begin(), eSpaces.end());
-    for (std::vector<PermanentMemSpace*>::iterator i = spaces.begin(); i < spaces.end(); i++)
-    {
-        char *bottom = (char*)(*i)->bottom, *top = (char*)(*i)->top;
-        if ((*i)->isCode && bottom >= codeAreaBase && bottom < codeAreaTop && top > next)
-            next = top;
-    }
-    return next;
+    savedCodeFloor = depth == 0 ? 0 : codeAreaBase + (size_t)(depth - 1) * 64 * 1024 * 1024;
 }
 #endif
 
@@ -596,7 +587,8 @@ PermanentMemSpace* MemMgr::NewExportSpace(uintptr_t size, bool mut, bool noOv, b
             void* shadow;
             space->bottom = 0;
 #ifdef POLYML_PLACE_SAVED_CODE
-            space->bottom = (PolyWord*)osCodeAlloc.AllocateCodeAreaAbove(iSpace, shadow, SavedCodeFloor());
+            if (savedCodeFloor != 0)
+                space->bottom = (PolyWord*)osCodeAlloc.AllocateCodeAreaAbove(iSpace, shadow, savedCodeFloor);
             if (space->bottom == 0)
 #endif
                 space->bottom = (PolyWord*)alloc->AllocateCodeArea(iSpace, shadow);
