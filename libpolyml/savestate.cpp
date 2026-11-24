@@ -1565,8 +1565,9 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
         anyMoved = anyMoved || moved[j];
         if (moved[j]) movedCount++;
-        // Segments with data in this file, rather than in a parent or the executable.
-        if (descrs[j].segmentData != 0)
+        // Segments this file creates, rather than ones in a parent or the executable,
+        // including those whose contents it overwrites.
+        if (descrs[j].segmentData != 0 && (descrs[j].segmentFlags & SSF_OVERWRITE) == 0)
         {
             ownCount++;
             if (moved[j]) ownMoved++;
@@ -1649,7 +1650,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
 #else
             "LOAD: %s: "
 #endif
-            "%zu of %zu segments moved (%zu of the %zu in this file), %llu relocations read, %llu applied; "
+            "%zu of %zu segments moved (%zu of the %zu this file creates), %llu relocations read, %llu applied; "
             "loads with moved segments: %u states, %u modules\n",
             (TCHAR*)thisFile, movedCount, descrs.size(), ownMoved, ownCount, (unsigned long long)relocsRead,
             (unsigned long long)relocsApplied, movedStateLoads, movedModuleLoads);

@@ -7,7 +7,7 @@
    child loads the hierarchy twice, so that the second load finds the first's
    data and code where it wants to put its own and has to relocate both, then
    saves a grandchild that a fourth child loads.  The first load must not move
-   any segment the files hold. *)
+   any segment the files create. *)
 case #lookupStruct (PolyML.globalNameSpace) "Unix" of
     SOME _ => ()
 |   NONE => raise NotApplicable;
@@ -108,10 +108,11 @@ val loadGrandchild =
     \val () = OS.Process.exit (if ok then OS.Process.success else OS.Process.failure);\n";
 
 (* With --debug savetime each load logs
-   "LOAD: <file>: <n> of <m> segments moved (<k> of the <l> in this file), ...".
-   The first load must find every segment of both files where it was saved, code
-   included: the executable's own segments may move if it is position-independent.
-   The second load of the child must have moved some of its segments. *)
+   "LOAD: <file>: <n> of <m> segments moved (<k> of the <l> this file creates), ...".
+   The first load must put every segment either file creates where it was saved,
+   code included.  The executable's segments, and the ones the files overwrite in
+   it, may move if it is position-independent.  The second load of the child must
+   have moved some of the segments it creates. *)
 fun ownMoved (file: string) (out: string): int list =
 let
     val prefix = "LOAD: " ^ file ^ ": "
@@ -141,5 +142,5 @@ if savedChild then () else raise Fail "saving the hierarchy failed";
 if mappedOk then () else raise Fail "the hierarchy was not mapped or its values differ";
 if relocatedOk then () else raise Fail "the relocated hierarchy was mapped or its values differ";
 if twiceOk then () else raise Fail "the hierarchy loaded twice has wrong values or its child couldn't be saved";
-if placedThenMoved twiceOut then () else raise Fail "the first load moved a segment saved in a file or the second didn't relocate the child";
+if placedThenMoved twiceOut then () else raise Fail "the first load moved a segment a file creates or the second didn't relocate the child";
 if grandchildOk then () else raise Fail "the grandchild saved after relocating has wrong values";
