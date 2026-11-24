@@ -170,8 +170,7 @@ private:
     uintptr_t defaultImmSize, defaultCodeSize, defaultMutSize, defaultNoOverSize;
 
     GraveYard *graveYard;
-    unsigned tombs, graveYardSize;
-    void addGraveYard(PermanentMemSpace *space);
+    unsigned tombs;
 
 public:
     // The space Ids for spaces that are dependencies.

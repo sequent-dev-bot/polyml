@@ -378,7 +378,14 @@ void* OSMemInRegion::AllocateCodeAreaAbove(size_t& space, void*& shadowArea, voi
         pageMap.SetBits(candidate, pages);
         offset = candidate * pageSize;
     }
-    return MapCodeArea(offset, space, shadowArea);
+    void* result = MapCodeArea(offset, space, shadowArea);
+    if (result == 0)
+    {
+        // The caller falls back to AllocateCodeArea: don't leave these pages marked.
+        PLocker l(&bitmapLock);
+        pageMap.ClearBits(offset / pageSize, space / pageSize);
+    }
+    return result;
 }
 
 // Make the pages at offset, already marked as allocated, usable for code.

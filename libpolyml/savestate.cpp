@@ -760,9 +760,6 @@ void SaveRequest::Perform()
             success = false;
             if (debugOptions & DEBUG_SAVING)
                 Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
-            // The scan may have stopped after forwarding objects in permanent spaces.  Restore
-            // them: what refers to them keeps the originals, and the copies are promoted below.
-            CopyScan::fixPermanentAreas();
         }
 #ifdef POLYML_PLACE_SAVED_CODE
         gMem.SetSavedCodeDepth(0);
