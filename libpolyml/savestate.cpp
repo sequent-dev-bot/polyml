@@ -760,6 +760,9 @@ void SaveRequest::Perform()
             success = false;
             if (debugOptions & DEBUG_SAVING)
                 Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
+            // The scan may have stopped after forwarding objects in permanent spaces.  Restore
+            // them: what refers to them keeps the originals, and the copies are promoted below.
+            CopyScan::fixPermanentAreas();
         }
 #ifdef POLYML_PLACE_SAVED_CODE
         gMem.SetSavedCodeDepth(0);
@@ -1218,25 +1221,21 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
 // they were saved, so that relocations were read.
 static unsigned movedStateLoads = 0, movedModuleLoads = 0;
 
-// Load a saved state file.  Calls itself to handle parent files.
 // Relocate a segment saved without a relocation table: add to each address in its objects
-// how far the segment it points into has moved.  Returns an error message or 0.
+// how far the segment it points into has moved.  byAddress lists the segments, by index,
+// in the order of their original addresses.  Returns an error message or 0.
 static const char *relocateByScanning(PolyWord *base, size_t segmentSize, const std::vector<SavedStateSegmentDescr> &descrs,
+    const std::vector<std::pair<uintptr_t, size_t> > &byAddress,
     const std::vector<StateLoadData> &loadData, const std::vector<bool> &moved, uint64_t &relocsApplied)
 {
-    // The segments by their original address.
-    std::vector<std::pair<uintptr_t, size_t> > byAddress;
-    for (size_t j = 0; j < descrs.size(); j++)
-        if (descrs[j].segmentSize != 0)
-            byAddress.push_back(std::make_pair((uintptr_t)descrs[j].originalAddr, j));
-    std::sort(byAddress.begin(), byAddress.end());
-
     PolyWord *end = base + segmentSize / sizeof(PolyWord);
     for (PolyWord *p = base; p < end; )
     {
         p++;
         PolyObject *obj = (PolyObject*)p;
         POLYUNSIGNED length = obj->Length();
+        if (length > (POLYUNSIGNED)(end - p))
+            return "Object in saved state runs past its segment";
         if (obj->IsCodeObject())
             return "Code in a saved state segment without relocations";
         if (!obj->IsByteObject())
@@ -1269,6 +1268,7 @@ static const char *relocateByScanning(PolyWord *base, size_t segmentSize, const 
     return 0;
 }
 
+// Load a saved state file.  Calls itself to handle parent files.
 bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail)
 {
     AutoFree<TCHAR*> thisFile(_tcsdup(fileName));
@@ -1558,13 +1558,28 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     // no longer where it was then.
     std::vector<bool> moved(descrs.size());
     bool anyMoved = false;
-    size_t movedCount = 0;
+    size_t movedCount = 0, ownCount = 0, ownMoved = 0;
     uint64_t relocsRead = 0, relocsApplied = 0;
     for (size_t j = 0; j < descrs.size(); j++)
     {
         moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
         anyMoved = anyMoved || moved[j];
         if (moved[j]) movedCount++;
+        // Segments with data in this file, rather than in a parent or the executable.
+        if (descrs[j].segmentData != 0)
+        {
+            ownCount++;
+            if (moved[j]) ownMoved++;
+        }
+    }
+    // The segments by their original address, for relocating segments without relocations.
+    std::vector<std::pair<uintptr_t, size_t> > byAddress;
+    if (anyMoved)
+    {
+        for (size_t j = 0; j < descrs.size(); j++)
+            if (descrs[j].segmentSize != 0)
+                byAddress.push_back(std::make_pair((uintptr_t)descrs[j].originalAddr, j));
+        std::sort(byAddress.begin(), byAddress.end());
     }
     std::vector<RelocationEntry> relocBuffer(anyMoved ? 4096 : 0);
     for (size_t j = 0; j < loadData.size(); j++)
@@ -1605,7 +1620,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         }
         else if (anyMoved && descrs[j].segmentData != 0 && (descrs[j].segmentFlags & (SSF_BYTES | SSF_CODE)) == 0)
         {
-            const char *error = relocateByScanning(baseAddr, descrs[j].segmentSize, descrs, loadData, moved, relocsApplied);
+            const char *error = relocateByScanning(baseAddr, descrs[j].segmentSize, descrs, byAddress, loadData, moved, relocsApplied);
             if (error != 0)
             {
                 errorResult = error;
@@ -1628,9 +1643,15 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     if (anyMoved)
         movedStateLoads++;
     if (debugOptions & (DEBUG_SAVING | DEBUG_SAVETIME))
-        Log("LOAD: %s: %zu of %zu segments moved, %llu relocations read, %llu applied; "
+        Log(
+#if (defined(_WIN32) && defined(UNICODE))
+            "LOAD: %S: "
+#else
+            "LOAD: %s: "
+#endif
+            "%zu of %zu segments moved (%zu of the %zu in this file), %llu relocations read, %llu applied; "
             "loads with moved segments: %u states, %u modules\n",
-            (const char*)thisFile, movedCount, descrs.size(), (unsigned long long)relocsRead,
+            (TCHAR*)thisFile, movedCount, descrs.size(), ownMoved, ownCount, (unsigned long long)relocsRead,
             (unsigned long long)relocsApplied, movedStateLoads, movedModuleLoads);
 
     // Add an entry to the hierarchy table for this file.

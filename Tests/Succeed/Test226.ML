@@ -6,7 +6,8 @@
    same values.  Code segments are loaded where they were saved too: a third
    child loads the hierarchy twice, so that the second load finds the first's
    data and code where it wants to put its own and has to relocate both, then
-   saves a grandchild that a fourth child loads. *)
+   saves a grandchild that a fourth child loads.  The first load must not move
+   any segment the files hold. *)
 case #lookupStruct (PolyML.globalNameSpace) "Unix" of
     SOME _ => ()
 |   NONE => raise NotApplicable;
@@ -106,16 +107,28 @@ val loadGrandchild =
     "val ok = ok andalso length zs = 100000 andalso hd zs = (0, 1);\n\
     \val () = OS.Process.exit (if ok then OS.Process.success else OS.Process.failure);\n";
 
-(* With --debug savetime each load logs "LOAD: <file>: <n> of <m> segments moved".
-   The second load of the child must have moved some. *)
-fun movedTwice (out: string) =
+(* With --debug savetime each load logs
+   "LOAD: <file>: <n> of <m> segments moved (<k> of the <l> in this file), ...".
+   The first load must find every segment of both files where it was saved, code
+   included: the executable's own segments may move if it is position-independent.
+   The second load of the child must have moved some of its segments. *)
+fun ownMoved (file: string) (out: string): int list =
 let
-    fun loadOfChild l = String.isPrefix ("LOAD: " ^ childFile ^ ": ") l
-    val moved = List.filter loadOfChild (String.fields (fn c => c = #"\n") out)
-    fun movedCount l = Int.fromString (hd (String.tokens Char.isSpace (String.extract (l, size ("LOAD: " ^ childFile ^ ": "), NONE))))
+    val prefix = "LOAD: " ^ file ^ ": "
+    val lines = List.filter (String.isPrefix prefix) (String.fields (fn c => c = #"\n") out)
+    fun own l =
+        case String.fields (fn c => c = #"(") l of
+            _ :: rest :: _ => (case Int.fromString rest of SOME n => n | NONE => raise Fail l)
+          | _ => raise Fail l
 in
-    case moved of [_, second] => (case movedCount second of SOME n => n > 0 | NONE => false) | _ => false
+    map own lines
 end;
+
+fun placedThenMoved (out: string) =
+    (case (ownMoved parentFile out, ownMoved childFile out) of
+        (0 :: _, [0, second]) => second > 0
+      | _ => false)
+    handle Fail _ => false;
 
 val savedParent = runChild saveParent;
 val savedChild = savedParent andalso runChild saveChild;
@@ -128,5 +141,5 @@ if savedChild then () else raise Fail "saving the hierarchy failed";
 if mappedOk then () else raise Fail "the hierarchy was not mapped or its values differ";
 if relocatedOk then () else raise Fail "the relocated hierarchy was mapped or its values differ";
 if twiceOk then () else raise Fail "the hierarchy loaded twice has wrong values or its child couldn't be saved";
-if movedTwice twiceOut then () else raise Fail "loading the hierarchy again didn't relocate it";
+if placedThenMoved twiceOut then () else raise Fail "the first load moved a segment saved in a file or the second didn't relocate the child";
 if grandchildOk then () else raise Fail "the grandchild saved after relocating has wrong values";
