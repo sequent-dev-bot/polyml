@@ -399,8 +399,14 @@ public:
         unsigned j = sizeof(void *)*8;
         for (;;)
         {
-            if (tr == 0 || tr->isSpace)
-                return (MemSpace*)tr;
+            if (tr == 0)
+                return 0;
+            if (tr->isSpace)
+            {
+                // The tree holds whole pages of a space: see TreeBottom.
+                MemSpace *s = (MemSpace*)tr;
+                return t >= (uintptr_t)s->bottom && t < (uintptr_t)s->top ? s : 0;
+            }
             j -= 8;
             tr = ((SpaceTreeTree*)tr)->tree[(t >> j) & 0xff];
         }
@@ -523,8 +529,19 @@ private:
     // LocalSpaceForAddress is a hot-spot so we use a B-tree to convert addresses;
     SpaceTree *spaceTree;
     PLock spaceTreeLock;
-    void AddTree(MemSpace *space) { AddTree(space, space->bottom, space->top); }
-    void RemoveTree(MemSpace *space) { RemoveTree(space, space->bottom, space->top); }
+    // The range a space has in the tree.  A space the memory manager allocated has whole OS
+    // pages, which nothing else shares, and the tree gets all of them: a range that starts
+    // or ends inside a page, like that of a module mapped from its file, would need nodes at
+    // the tree's deepest level.  Spaces in the executable can share pages.
+    PolyWord *TreeBottom(MemSpace *space)
+    { return space->allocator == 0 ? space->bottom : (PolyWord*)((uintptr_t)space->bottom & ~(uintptr_t)(osHeapAlloc.PageSize() - 1)); }
+    PolyWord *TreeTop(MemSpace *space)
+    {
+        uintptr_t pageMask = (uintptr_t)(osHeapAlloc.PageSize() - 1);
+        return space->allocator == 0 ? space->top : (PolyWord*)(((uintptr_t)space->top + pageMask) & ~pageMask);
+    }
+    void AddTree(MemSpace *space) { AddTree(space, TreeBottom(space), TreeTop(space)); }
+    void RemoveTree(MemSpace *space) { RemoveTree(space, TreeBottom(space), TreeTop(space)); }
     void AddTree(MemSpace *space, PolyWord *startS, PolyWord *endS);
     void RemoveTree(MemSpace *space, PolyWord *startS, PolyWord *endS);
 

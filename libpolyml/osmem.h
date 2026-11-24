@@ -77,6 +77,8 @@ public:
     // either from importing a portable export file or copying the area in 32-in-64.
     virtual bool DisableWriteForCode(void* codeAddr, void* dataAddr, size_t space) = 0;
 
+    size_t PageSize() const { return pageSize; }
+
 protected:
     size_t pageSize;
     enum _MemUsage memUsage;

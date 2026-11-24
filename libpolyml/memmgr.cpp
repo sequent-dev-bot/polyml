@@ -1536,7 +1536,7 @@ void MemMgr::RemoveTreeRange(SpaceTree **tt, MemSpace *space, uintptr_t startS, 
 void MemMgr::ReplaceTree(MemSpace *oldS, MemSpace *newS)
 {
     PLocker lock(&spaceTreeLock);
-    ReplaceTreeRange(&spaceTree, oldS, newS, (uintptr_t)oldS->bottom, (uintptr_t)oldS->top);
+    ReplaceTreeRange(&spaceTree, oldS, newS, (uintptr_t)TreeBottom(oldS), (uintptr_t)TreeTop(oldS));
 }
 
 void MemMgr::ReplaceTreeRange(SpaceTree **tt, MemSpace *oldS, MemSpace *newS, uintptr_t startS, uintptr_t endS)
