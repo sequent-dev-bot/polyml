@@ -161,7 +161,7 @@ class PermanentMemSpace: public MemSpace
 {
 protected:
     PermanentMemSpace(OSMem *alloc): MemSpace(alloc), index(0), isWriteProtected(false), noOverwrite(false),
-        byteOnly(false), constArea(false), topPointer(0), copyGraves(0) {
+        byteOnly(false), constArea(false), topPointer(0), copyGraves(0), isExportDependency(false), hasForwarded(false) {
     }
 
 public:
@@ -178,6 +178,10 @@ public:
     Bitmap      profileCode; // Used when profiling
     // While CopyScan runs: where the tombstones for this write-protected space are, if any.
     PolyWord    *copyGraves;
+    // While CopyScan runs: whether the space is a dependency, whose objects aren't copied.
+    bool        isExportDependency;
+    // Whether CopyScan has left forwarding pointers in the space, which fixPermanentAreas removes.
+    bool        hasForwarded;
 
     ModuleId    moduleIdentifier; // The identifier of the source module, usually the executable itself.
 

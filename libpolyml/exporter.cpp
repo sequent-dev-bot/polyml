@@ -140,7 +140,7 @@ CopyScan::CopyScan(bool isExp /*=false*/)
     isExport = isExp;
     depth = 0;
     defaultImmSize = defaultMutSize = defaultCodeSize = defaultNoOverSize = 0;
-    tombs = 0;
+    tombs = graveYardSize = 0;
     graveYard = 0;
     singleImmutableArea = false;
     hash_a = hash_b = hash_c = 0xdeadbeef;
@@ -166,11 +166,14 @@ void CopyScan::initialise()
     // Write-protected permanent spaces need a graveyard when saving a state or a module too:
     // module segments mapped from their files are write-protected.
     graveYard = new GraveYard[gMem.pSpaces.size()];
+    graveYardSize = (unsigned)gMem.pSpaces.size();
 
     for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
     {
         PermanentMemSpace *space = *i;
-        if (! dependencies[space->moduleIdentifier]) {
+        space->isExportDependency = dependencies[space->moduleIdentifier];
+        space->hasForwarded = false;
+        if (! space->isExportDependency) {
             // Include this if we're exporting (hierarchy=0) or if we're saving a state
             // and will include this in the new state.
             size_t size = (space->top-space->bottom)/4;
@@ -182,26 +185,6 @@ void CopyScan::initialise()
                 defaultCodeSize += size;
             else
                 defaultImmSize += size;
-            if (space->isWriteProtected)
-            {
-                // We need a separate area for the tombstones because this is read-only
-                graveYard[tombs].graves = (PolyWord*)calloc(space->spaceSize(), sizeof(PolyWord));
-                if (graveYard[tombs].graves == 0)
-                {
-                    if (debugOptions & DEBUG_SAVING)
-                        Log("SAVE: Unable to allocate graveyard for permanent space, size: %lu.\n",
-                            space->spaceSize() * sizeof(PolyWord));
-                    throw MemoryException();
-                }
-                if (debugOptions & DEBUG_SAVING)
-                    Log("SAVE: Allocated graveyard for permanent space, %p size: %lu.\n",
-                        graveYard[tombs].graves, space->spaceSize() * sizeof(PolyWord));
-                graveYard[tombs].startAddr = space->bottom;
-                graveYard[tombs].endAddr = space->top;
-                graveYard[tombs].space = space;
-                space->copyGraves = graveYard[tombs].graves;
-                tombs++;
-            }
         }
     }
     for (std::vector<LocalMemSpace*>::iterator i = gMem.lSpaces.begin(); i < gMem.lSpaces.end(); i++)
@@ -275,6 +258,30 @@ void CopyScan::initialise()
             defaultImmSize, defaultMutSize, defaultCodeSize, defaultNoOverSize);
 }
 
+// Give a write-protected space a graveyard for the tombstones of the objects copied out of it.
+// Done when the first object is copied, since most are dependencies or have nothing copied.
+void CopyScan::addGraveYard(PermanentMemSpace *space)
+{
+    ASSERT(tombs < graveYardSize);
+    PolyWord *graves = (PolyWord*)calloc(space->spaceSize(), sizeof(PolyWord));
+    if (graves == 0)
+    {
+        if (debugOptions & DEBUG_SAVING)
+            Log("SAVE: Unable to allocate graveyard for permanent space, size: %lu.\n",
+                space->spaceSize() * sizeof(PolyWord));
+        throw MemoryException();
+    }
+    if (debugOptions & DEBUG_SAVING)
+        Log("SAVE: Allocated graveyard for permanent space, %p size: %lu.\n",
+            graves, space->spaceSize() * sizeof(PolyWord));
+    graveYard[tombs].graves = graves;
+    graveYard[tombs].startAddr = space->bottom;
+    graveYard[tombs].endAddr = space->top;
+    graveYard[tombs].space = space;
+    space->copyGraves = graves;
+    tombs++;
+}
+
 CopyScan::~CopyScan()
 {
     gMem.DeleteExportSpaces();
@@ -320,7 +327,7 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
     if (space->spaceType == ST_PERMANENT)
     {
         PermanentMemSpace *pmSpace = (PermanentMemSpace*)space;
-        if (dependencies[pmSpace->moduleIdentifier])
+        if (pmSpace->isExportDependency)
             return 0;
     }
 
@@ -430,11 +437,15 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
         else memcpy(writAble, obj, words * sizeof(PolyWord));
     }
 
+    // An object in any other permanent space is forwarded in place, below: fixPermanentAreas reverts that.
+    if (space->spaceType == ST_PERMANENT && !((PermanentMemSpace*)space)->isWriteProtected)
+        ((PermanentMemSpace*)space)->hasForwarded = true;
     if (space->spaceType == ST_PERMANENT && ((PermanentMemSpace*)space)->isWriteProtected)
     {
         // The immutable permanent areas are read-only.
         PermanentMemSpace *pmSpace = (PermanentMemSpace*)space;
-        ASSERT(pmSpace->copyGraves != 0); // Should be there.
+        if (pmSpace->copyGraves == 0)
+            addGraveYard(pmSpace);
         PolyWord *tombAddr = pmSpace->copyGraves + ((PolyWord*)obj - pmSpace->bottom);
         PolyObject *tombObject = (PolyObject*)tombAddr;
 #ifdef POLYML32IN64
@@ -1144,10 +1155,11 @@ void CopyScan::fixPermanentAreas()
     {
         PermanentMemSpace* space = *i;
         // Objects in write-protected areas are never forwarded: their tombstones are in the graveyard.
-        if (space->isWriteProtected)
+        if (space->isWriteProtected || !space->hasForwarded)
             continue;
         // Permanent areas are filled with objects from the bottom.
         FixForwarding(space->bottom, space->top - space->bottom);
+        space->hasForwarded = false;
     }
 }
 
