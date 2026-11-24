@@ -57,5 +57,6 @@ extern unsigned    debugOptions; // debugging  flags
 #define DEBUG_RTSCALLS      0x0400      // Information about run-time calls. Not currently used.
 #define DEBUG_GC_ENHANCED   0x0800      // Intermediate level GC output
 #define DEBUG_SAVING        0x1000      // Saving state and exporting
+#define DEBUG_SAVETIME      0x2000      // Times of the phases of saving and loading states and modules
 
 #endif

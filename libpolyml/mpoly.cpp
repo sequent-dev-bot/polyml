@@ -164,7 +164,8 @@ static struct __debugOpts {
     { _T("sharing"),            "Information from PolyML.shareCommonData",          DEBUG_SHARING},
     { _T("locks"),              "Information about contended locks",                DEBUG_CONTENTION},
     { _T("rts"),                "General run-time system calls",                    DEBUG_RTSCALLS},
-    { _T("saving"),             "Saving and loading state; exporting",              DEBUG_SAVING }
+    { _T("saving"),             "Saving and loading state; exporting",              DEBUG_SAVING },
+    { _T("savetime"),           "Times of the phases of saving and loading",        DEBUG_SAVETIME }
 };
 
 // Parse a parameter that is meant to be a size.  Returns the value as a number

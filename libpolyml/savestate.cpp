@@ -79,6 +79,8 @@
 #include <algorithm>
 #include <unordered_set>
 #include <stdexcept>
+#include <chrono>
+#include <ctime>
 
 #if (defined(_WIN32))
 #include <tchar.h>
@@ -328,6 +330,29 @@ static const char* readModuleTable(FILE* f, const SavedStateHeader* header, std:
 }
 
 #define SAVE(x) taskData->saveVec.push(x)
+
+static void LogPhase(const char* phase, double wall, double cpu)
+{
+    if (debugOptions & DEBUG_SAVETIME)
+        Log("SAVETIME: %s wall=%.3f cpu=%.3f\n", phase, wall, cpu);
+}
+
+// The wall and processor time of the phases of saving and loading, logged with --debug savetime.
+class PhaseClock
+{
+public:
+    PhaseClock() { Restart(); }
+    void Restart() { wallStart = std::chrono::steady_clock::now(); cpuStart = std::clock(); }
+    double Wall() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count(); }
+    double Cpu() const { return (double)(std::clock() - cpuStart) / CLOCKS_PER_SEC; }
+    // Log the time since the last restart as a phase, and restart.
+    void Lap(const char* phase) { LogPhase(phase, Wall(), Cpu()); Restart(); }
+    // Add the time since the last restart to totals, and restart.
+    void AddTo(double& wall, double& cpu) { wall += Wall(); cpu += Cpu(); Restart(); }
+private:
+    std::chrono::steady_clock::time_point wallStart;
+    std::clock_t cpuStart;
+};
 
 /*
  *  Hierarchy table: contains information about last loaded or saved state.
@@ -688,6 +713,7 @@ void SaveRequest::Perform()
             }
         }
         bool success = true;
+        PhaseClock clock;
         try {
             copyScan.initialise();
             // By index: making an export space reserves pSpaces capacity, which may move it.
@@ -702,8 +728,10 @@ void SaveRequest::Perform()
                     copyScan.ScanAddressesInRegion(space->bottom, space->top);
                 }
             }
+            clock.Lap("save-scan");
             // We may have copied data out of modules.  Restore forwarding pointers in them.
             CopyScan::fixPermanentAreas();
+            clock.Lap("save-fixperm");
         }
         catch (MemoryException&)
         {
@@ -803,6 +831,7 @@ void SaveRequest::Perform()
             return;
         }
 
+        clock.Lap("save-promote");
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Writing out data.\n");
 
@@ -868,6 +897,8 @@ void SaveRequest::Perform()
         }
 
         // Write out the relocations and the data.
+        double relocWall = 0, relocCpu = 0, dataWall = 0, dataCpu = 0;
+        uint64_t relocTotal = 0;
         for (unsigned k = 1 /* Not IO area */; k < memTableEntries; k++)
         {
             ExportMemTable* entry = &memTable[k];
@@ -894,6 +925,8 @@ void SaveRequest::Perform()
                     p += length;
                 }
                 descrs[k].relocationCount = relocationCount;
+                relocTotal += relocationCount;
+                clock.AddTo(relocWall, relocCpu);
                 // Write out the data, starting at a multiple of 64K so that it can be mapped.
                 static const char zeros[4096] = { 0 };
                 for (off_t pos = ftell(exportFile); pos % (64 * 1024) != 0; )
@@ -907,8 +940,14 @@ void SaveRequest::Perform()
                 descrs[k].segmentData = ftell(exportFile);
                 if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
                     return;
+                clock.AddTo(dataWall, dataCpu);
             }
         }
+        LogPhase("save-relocs", relocWall, relocCpu);
+        LogPhase("save-data", dataWall, dataCpu);
+        if (debugOptions & DEBUG_SAVETIME)
+            Log("SAVETIME: save-relocations count=%llu bytes=%llu\n",
+                (unsigned long long)relocTotal, (unsigned long long)(relocTotal * sizeof(RelocationEntry)));
 
         // If this is a child we need to write a string table containing the parent name.
         if (newHierarchy > 1)
@@ -951,6 +990,7 @@ void SaveRequest::Perform()
         if (!checkedFwrite(descrs.data(), sizeof(SavedStateSegmentDescr), memTableEntries))
             return;
 
+        clock.Lap("save-tables");
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Writing complete.\n");
 
@@ -988,10 +1028,13 @@ static POLYUNSIGNED saveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLY
         // Request a full GC first.  The main reason is to avoid running out of memory as a
         // result of repeated saves.  Old export spaces are turned into local spaces and
         // the GC will delete them if they are completely empty
+        PhaseClock clock;
         FullGC(taskData);
+        clock.Lap("save-fullgc");
 
         SaveRequest request(fileNameBuff, newHierarchy, withModules);
         processes->MakeRootRequest(taskData, &request);
+        clock.Lap("save-request");
         if (request.errorMessage)
             raise_syscall(taskData, request.errorMessage, request.errNumber);
     }
@@ -1135,6 +1178,10 @@ size_t readData(void *ptr, size_t size, FILE *stream)
 static bool loadModuleFile(const std_tstring& fileName, const ModuleId* requiredId,
     const char*& errorResult, int& errNumber, PolyObject*& root, ModuleId& loadedId);
 
+// The number of saved state and module files loaded so far that had segments not where
+// they were saved, so that relocations were read.
+static unsigned movedStateLoads = 0, movedModuleLoads = 0;
+
 // Load a saved state file.  Calls itself to handle parent files.
 bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail)
 {
@@ -1254,6 +1301,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     // Load the modules this state depends on that aren't already loaded.  This is done
     // after the parents are loaded because loading the top-level state unloads all modules,
     // and before this state's segments because they may overwrite or refer to the modules' spaces.
+    PhaseClock clock;
     std::vector<ModuleTableItem> moduleTable;
     errorResult = readModuleTable(loadFile, &fullHeader, moduleTable);
     if (errorResult != NULL)
@@ -1287,6 +1335,8 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
             return false;
         }
     }
+
+    clock.Lap("load-modules");
 
     // Now have a valid, matching saved state.
     // Load the segment descriptors.
@@ -1396,6 +1446,8 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         loadData.push_back(load);
     }
 
+    clock.Lap("load-segments");
+
     // Now read in the mutable overwrites.  This overwrites the muable areas with the values from the saved state.
     for (std::vector<SavedStateSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
     {
@@ -1416,15 +1468,20 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         }
     }
 
+    clock.Lap("load-overwrite");
+
     // Now the relocations.  The saved data holds the values it had when saved, so an
     // entry needs applying only if the segment it is in or the one it points into is
     // no longer where it was then.
     std::vector<bool> moved(descrs.size());
     bool anyMoved = false;
+    size_t movedCount = 0;
+    uint64_t relocsRead = 0, relocsApplied = 0;
     for (size_t j = 0; j < descrs.size(); j++)
     {
         moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
         anyMoved = anyMoved || moved[j];
+        if (moved[j]) movedCount++;
     }
     std::vector<RelocationEntry> relocBuffer(anyMoved ? 4096 : 0);
     for (size_t j = 0; j < loadData.size(); j++)
@@ -1457,11 +1514,22 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
                     byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
                     byte *targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
                     ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                    relocsApplied++;
                 }
+                relocsRead += n;
                 k += (unsigned)n;
             }
         }
     }
+
+    clock.Lap("load-relocs");
+    if (anyMoved)
+        movedStateLoads++;
+    if (debugOptions & (DEBUG_SAVING | DEBUG_SAVETIME))
+        Log("LOAD: %s: %zu of %zu segments moved, %llu relocations read, %llu applied; "
+            "loads with moved segments: %u states, %u modules\n",
+            (const char*)thisFile, movedCount, descrs.size(), (unsigned long long)relocsRead,
+            (unsigned long long)relocsApplied, movedStateLoads, movedModuleLoads);
 
     // Add an entry to the hierarchy table for this file.
     HierarchyTable level(thisFile, header.timeStamp);
@@ -2114,13 +2182,16 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         }
     }
 
+    PhaseClock clock;
     try {
         copyScan.initialise();
         // Copy the root and everything reachable from it into the temporary area.
         copiedRoot = copyScan.ScanObjectAddress(rootFn);
+        clock.Lap("module-scan");
         // Fix the permanent areas.  We may have copied cells from modules if they are
         // not dependencies.
         CopyScan::fixPermanentAreas();
+        clock.Lap("module-fixperm");
     }
     catch (MemoryException&)
     {
@@ -2960,6 +3031,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         bool anyMoved = false;
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
             anyMoved = anyMoved || i->moved;
+        if (anyMoved)
+            movedModuleLoads++;
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); anyMoved && i < loadData.end(); i++)
         {
             PolyWord* baseAddr = i->targetAddr;
