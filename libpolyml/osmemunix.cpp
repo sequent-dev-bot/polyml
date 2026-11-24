@@ -295,7 +295,7 @@ void* OSMemInRegion::AllocateDataArea(size_t& space)
         // Round up to an integral number of pages.
         space = pages * pageSize;
         // Find some space
-        while (pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
+        while (lastAllocated > 0 && pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
             lastAllocated--;
         uintptr_t free = pageMap.FindFree(0, lastAllocated, pages);
         if (free == lastAllocated)
@@ -344,7 +344,7 @@ void* OSMemInRegion::AllocateCodeArea(size_t& space, void*& shadowArea)
         // Round up to an integral number of pages.
         space = pages * pageSize;
         // Find some space
-        while (pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
+        while (lastAllocated > 0 && pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
             lastAllocated--;
         uintptr_t free = pageMap.FindFree(0, lastAllocated, pages);
         if (free == lastAllocated)

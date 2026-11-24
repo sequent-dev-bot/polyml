@@ -58,5 +58,6 @@ extern unsigned    debugOptions; // debugging  flags
 #define DEBUG_GC_ENHANCED   0x0800      // Intermediate level GC output
 #define DEBUG_SAVING        0x1000      // Saving state and exporting
 #define DEBUG_SAVETIME      0x2000      // Times of the phases of saving and loading states and modules
+#define DEBUG_SAVE_RELOCATIONS 0x4000   // Save states in version 5, with relocations for all segments
 
 #endif

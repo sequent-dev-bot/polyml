@@ -206,7 +206,8 @@ private:
 #define SAVEDSTATEVERSIONWITHMODULES   5
 // Version 6 has the version 5 layout, but a segment that contains no code has no relocation
 // table: if a segment it points into isn't where it was when saved, the loader finds the
-// addresses by scanning its objects.  Written where saved states are mapped.
+// addresses by scanning its objects.  Written where saved code is placed, unless
+// --debug saverelocs asks for every table.
 #define SAVEDSTATEVERSIONSCANNED   6
 
 // File header for a saved state file.  This appears as the first entry
@@ -734,7 +735,11 @@ void SaveRequest::Perform()
         bool success = true;
         PhaseClock clock;
 #ifdef POLYML_PLACE_SAVED_CODE
-        gMem.SetSavedCodeDepth(newHierarchy);
+        // Place the copied code for this depth until the scan ends, however it ends.
+        struct SavedCodeDepth {
+            SavedCodeDepth(unsigned depth) { gMem.SetSavedCodeDepth(depth); }
+            ~SavedCodeDepth() { gMem.SetSavedCodeDepth(0); }
+        } savedCodeDepth(newHierarchy);
 #endif
         try {
             copyScan.initialise();
@@ -864,8 +869,10 @@ void SaveRequest::Perform()
 
         // Write out the file header.  The version 5 layout only if there is a module table
         // or the segments without code have no relocations.
-#ifdef POLYML_MAP_SAVED_STATES
-        const bool scanned = true;
+#ifdef POLYML_PLACE_SAVED_CODE
+        // Data segments get no relocations only where code is placed: elsewhere the
+        // code moves on every load, and each load would walk all the data.
+        const bool scanned = (debugOptions & DEBUG_SAVE_RELOCATIONS) == 0;
 #else
         const bool scanned = false;
 #endif
@@ -1555,19 +1562,20 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     // no longer where it was then.
     std::vector<bool> moved(descrs.size());
     bool anyMoved = false;
-    size_t movedCount = 0, ownCount = 0, ownMoved = 0;
+    size_t movedCount = 0, ownCount = 0, ownMoved = 0, ownCodeMoved = 0;
     uint64_t relocsRead = 0, relocsApplied = 0;
     for (size_t j = 0; j < descrs.size(); j++)
     {
         moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
         anyMoved = anyMoved || moved[j];
         if (moved[j]) movedCount++;
-        // Segments this file creates, rather than ones in a parent or the executable,
-        // including those whose contents it overwrites.
+        // Segments this file creates, not ones in a parent or the executable whose
+        // contents it overwrites.
         if (descrs[j].segmentData != 0 && (descrs[j].segmentFlags & SSF_OVERWRITE) == 0)
         {
             ownCount++;
             if (moved[j]) ownMoved++;
+            if (moved[j] && (descrs[j].segmentFlags & SSF_CODE)) ownCodeMoved++;
         }
     }
     // The segments by their original address, for relocating segments without relocations.
@@ -1647,9 +1655,9 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
 #else
             "LOAD: %s: "
 #endif
-            "%zu of %zu segments moved (%zu of the %zu this file creates), %llu relocations read, %llu applied; "
+            "%zu of %zu segments moved (%zu of the %zu this file creates, %zu of them code), %llu relocations read, %llu applied; "
             "loads with moved segments: %u states, %u modules\n",
-            (TCHAR*)thisFile, movedCount, descrs.size(), ownMoved, ownCount, (unsigned long long)relocsRead,
+            (TCHAR*)thisFile, movedCount, descrs.size(), ownMoved, ownCount, ownCodeMoved, (unsigned long long)relocsRead,
             (unsigned long long)relocsApplied, movedStateLoads, movedModuleLoads);
 
     // Add an entry to the hierarchy table for this file.
