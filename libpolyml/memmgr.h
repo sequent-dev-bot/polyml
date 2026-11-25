@@ -35,6 +35,12 @@
 #if (defined(__linux__) && defined(__LP64__) && !defined(POLYML32IN64))
 #define POLYML_MAP_SAVED_STATES 1
 #endif
+// Saved-state code segments are allocated bottom-up in the code area, which is reserved at
+// a fixed address, and are loaded at the addresses they were saved at.  Data that points
+// only into segments that are where they were saved needs no relocation.
+#if (defined(POLYML_MAP_SAVED_STATES) && (defined(HOSTARCHITECTURE_X86_64) || defined(HOSTARCHITECTURE_AARCH64)))
+#define POLYML_PLACE_SAVED_CODE 1
+#endif
 
 // utility conversion macros
 #define Words_to_K(w) (w*sizeof(PolyWord))/1024
@@ -161,7 +167,7 @@ class PermanentMemSpace: public MemSpace
 {
 protected:
     PermanentMemSpace(OSMem *alloc): MemSpace(alloc), index(0), isWriteProtected(false), noOverwrite(false),
-        byteOnly(false), constArea(false), topPointer(0), copyGraves(0) {
+        byteOnly(false), constArea(false), topPointer(0), copyGraves(0), isExportDependency(false), hasForwarded(false) {
     }
 
 public:
@@ -178,6 +184,10 @@ public:
     Bitmap      profileCode; // Used when profiling
     // While CopyScan runs: where the tombstones for this write-protected space are, if any.
     PolyWord    *copyGraves;
+    // While CopyScan runs: whether the space is a dependency, whose objects aren't copied.
+    bool        isExportDependency;
+    // Whether CopyScan has left forwarding pointers in the space, which fixPermanentAreas removes.
+    bool        hasForwarded;
 
     ModuleId    moduleIdentifier; // The identifier of the source module, usually the executable itself.
 
@@ -293,7 +303,9 @@ public:
 
     // Create a permanent space but allocate memory for it.
     // Sets bottom and top to the actual memory size.
-    PermanentMemSpace *AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule);
+    // A code space is put at codeAddr, or as near above it as possible, if codeAddr is non-zero.
+    PermanentMemSpace *AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule,
+        void *codeAddr = 0);
     // Called after an allocated permanent area has been filled in.
     bool CompletePermanentSpaceAllocation(PermanentMemSpace *space);
 #ifdef POLYML_MAP_SAVED_STATES
@@ -357,6 +369,14 @@ private:
     void *AllocateInStateRegion(size_t &space);
 public:
 #endif
+#ifdef POLYML_PLACE_SAVED_CODE
+    // While a state at this depth (1 = top) is being saved its code goes in the depth's
+    // slot of the code area; 0 when no state is being saved.
+    void SetSavedCodeDepth(unsigned depth);
+private:
+    char *codeAreaBase, *savedCodeFloor;
+public:
+#endif
 
     PermanentMemSpace *SpaceForIndex(unsigned index, ModuleId modId); // Return the space for a given index
 private:
@@ -395,8 +415,14 @@ public:
         unsigned j = sizeof(void *)*8;
         for (;;)
         {
-            if (tr == 0 || tr->isSpace)
-                return (MemSpace*)tr;
+            if (tr == 0)
+                return 0;
+            if (tr->isSpace)
+            {
+                // The tree holds whole pages of a space: see TreeBottom.
+                MemSpace *s = (MemSpace*)tr;
+                return t >= (uintptr_t)s->bottom && t < (uintptr_t)s->top ? s : 0;
+            }
             j -= 8;
             tr = ((SpaceTreeTree*)tr)->tree[(t >> j) & 0xff];
         }
@@ -519,8 +545,19 @@ private:
     // LocalSpaceForAddress is a hot-spot so we use a B-tree to convert addresses;
     SpaceTree *spaceTree;
     PLock spaceTreeLock;
-    void AddTree(MemSpace *space) { AddTree(space, space->bottom, space->top); }
-    void RemoveTree(MemSpace *space) { RemoveTree(space, space->bottom, space->top); }
+    // The range a space has in the tree.  A space the memory manager allocated has whole OS
+    // pages, which nothing else shares, and the tree gets all of them: a range that starts
+    // or ends inside a page, like that of a module mapped from its file, would need nodes at
+    // the tree's deepest level.  Spaces in the executable can share pages.
+    PolyWord *TreeBottom(MemSpace *space)
+    { return space->allocator == 0 ? space->bottom : (PolyWord*)((uintptr_t)space->bottom & ~(uintptr_t)(osHeapAlloc.PageSize() - 1)); }
+    PolyWord *TreeTop(MemSpace *space)
+    {
+        uintptr_t pageMask = (uintptr_t)(osHeapAlloc.PageSize() - 1);
+        return space->allocator == 0 ? space->top : (PolyWord*)(((uintptr_t)space->top + pageMask) & ~pageMask);
+    }
+    void AddTree(MemSpace *space) { AddTree(space, TreeBottom(space), TreeTop(space)); }
+    void RemoveTree(MemSpace *space) { RemoveTree(space, TreeBottom(space), TreeTop(space)); }
     void AddTree(MemSpace *space, PolyWord *startS, PolyWord *endS);
     void RemoveTree(MemSpace *space, PolyWord *startS, PolyWord *endS);
 

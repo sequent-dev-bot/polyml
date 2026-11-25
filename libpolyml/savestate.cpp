@@ -79,6 +79,8 @@
 #include <algorithm>
 #include <unordered_set>
 #include <stdexcept>
+#include <chrono>
+#include <ctime>
 
 #if (defined(_WIN32))
 #include <tchar.h>
@@ -202,6 +204,11 @@ private:
 // Version 5 adds a module table: the modules the state depends on.  It is written
 // only when the table is non-empty so other states keep the version 4 layout.
 #define SAVEDSTATEVERSIONWITHMODULES   5
+// Version 6 has the version 5 layout, but a segment that contains no code has no relocation
+// table: if a segment it points into isn't where it was when saved, the loader finds the
+// addresses by scanning its objects.  Written where saved code is placed, unless
+// --debug saverelocs asks for every table.
+#define SAVEDSTATEVERSIONSCANNED   6
 
 // File header for a saved state file.  This appears as the first entry
 // in the file.
@@ -286,7 +293,8 @@ static const char* readStateHeader(FILE* f, SavedStateHeader* header)
         return "File is not a saved state";
     bool isV4 = header->v4.headerVersion == SAVEDSTATEVERSION &&
         header->v4.headerLength == sizeof(SavedStateHeaderV4);
-    bool isV5 = header->v4.headerVersion == SAVEDSTATEVERSIONWITHMODULES &&
+    bool isV5 = (header->v4.headerVersion == SAVEDSTATEVERSIONWITHMODULES ||
+            header->v4.headerVersion == SAVEDSTATEVERSIONSCANNED) &&
         header->v4.headerLength == sizeof(SavedStateHeaderV5);
     if (!(isV4 || isV5) || header->v4.segmentDescrLength != sizeof(SavedStateSegmentDescr))
         return "Unsupported version of saved state file";
@@ -328,6 +336,29 @@ static const char* readModuleTable(FILE* f, const SavedStateHeader* header, std:
 }
 
 #define SAVE(x) taskData->saveVec.push(x)
+
+static void LogPhase(const char* phase, double wall, double cpu)
+{
+    if (debugOptions & DEBUG_SAVETIME)
+        Log("SAVETIME: %s wall=%.3f cpu=%.3f\n", phase, wall, cpu);
+}
+
+// The wall and processor time of the phases of saving and loading, logged with --debug savetime.
+class PhaseClock
+{
+public:
+    PhaseClock() { Restart(); }
+    void Restart() { wallStart = std::chrono::steady_clock::now(); cpuStart = std::clock(); }
+    double Wall() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count(); }
+    double Cpu() const { return (double)(std::clock() - cpuStart) / CLOCKS_PER_SEC; }
+    // Log the time since the last restart as a phase, and restart.
+    void Lap(const char* phase) { LogPhase(phase, Wall(), Cpu()); Restart(); }
+    // Add the time since the last restart to totals, and restart.
+    void AddTo(double& wall, double& cpu) { wall += Wall(); cpu += Cpu(); Restart(); }
+private:
+    std::chrono::steady_clock::time_point wallStart;
+    std::clock_t cpuStart;
+};
 
 /*
  *  Hierarchy table: contains information about last loaded or saved state.
@@ -419,6 +450,20 @@ static bool sameFile(const char *x, const char *y)
 /*
  *  Saving state.
  */
+
+// Whether the objects from start to end include a code object.
+static bool containsCode(PolyWord* start, PolyWord* end)
+{
+    for (PolyWord* p = start; p < end; )
+    {
+        p++;
+        PolyObject* obj = (PolyObject*)p;
+        if (obj->IsCodeObject())
+            return true;
+        p += obj->Length();
+    }
+    return false;
+}
 
  // Request to the main thread to save data.
 class SaveRequest : public MainThreadRequest, public StateExport
@@ -688,6 +733,14 @@ void SaveRequest::Perform()
             }
         }
         bool success = true;
+        PhaseClock clock;
+#ifdef POLYML_PLACE_SAVED_CODE
+        // Place the copied code for this depth until the scan ends, however it ends.
+        struct SavedCodeDepth {
+            SavedCodeDepth(unsigned depth) { gMem.SetSavedCodeDepth(depth); }
+            ~SavedCodeDepth() { gMem.SetSavedCodeDepth(0); }
+        } savedCodeDepth(newHierarchy);
+#endif
         try {
             copyScan.initialise();
             // By index: making an export space reserves pSpaces capacity, which may move it.
@@ -702,8 +755,10 @@ void SaveRequest::Perform()
                     copyScan.ScanAddressesInRegion(space->bottom, space->top);
                 }
             }
+            clock.Lap("save-scan");
             // We may have copied data out of modules.  Restore forwarding pointers in them.
             CopyScan::fixPermanentAreas();
+            clock.Lap("save-fixperm");
         }
         catch (MemoryException&)
         {
@@ -711,6 +766,9 @@ void SaveRequest::Perform()
             if (debugOptions & DEBUG_SAVING)
                 Log("SAVE: Scan of permanent mutable area raised memory exception.\n");
         }
+#ifdef POLYML_PLACE_SAVED_CODE
+        gMem.SetSavedCodeDepth(0);
+#endif
 
         // Copy the areas into the export object.  Make sufficient space for
         // the largest possible number of entries.
@@ -803,20 +861,30 @@ void SaveRequest::Perform()
             return;
         }
 
+        clock.Lap("save-promote");
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Writing out data.\n");
 
         // TODO: We should handle write failures e.g. if the disc becomes full.
 
-        // Write out the file header.  The version 5 layout only if there is a module table.
+        // Write out the file header.  The version 5 layout only if there is a module table
+        // or the segments without code have no relocations.
+#ifdef POLYML_PLACE_SAVED_CODE
+        // Data segments get no relocations only where code is placed: elsewhere the
+        // code moves on every load, and each load would walk all the data.
+        const bool scanned = (debugOptions & DEBUG_SAVE_RELOCATIONS) == 0;
+#else
+        const bool scanned = false;
+#endif
         SavedStateHeaderV5 fullHeader;
         memset(&fullHeader, 0, sizeof(fullHeader));
         SavedStateHeaderV4& saveHeader = fullHeader.v4;
-        size_t headerSize = moduleTable.empty() ? sizeof(SavedStateHeaderV4) : sizeof(SavedStateHeaderV5);
+        size_t headerSize = moduleTable.empty() && !scanned ? sizeof(SavedStateHeaderV4) : sizeof(SavedStateHeaderV5);
         saveHeader.headerLength = (unsigned)headerSize;
         memcpy(saveHeader.headerSignature,
             SAVEDSTATESIGNATURE, sizeof(saveHeader.headerSignature));
-        saveHeader.headerVersion = moduleTable.empty() ? SAVEDSTATEVERSION : SAVEDSTATEVERSIONWITHMODULES;
+        saveHeader.headerVersion = scanned ? SAVEDSTATEVERSIONSCANNED :
+            moduleTable.empty() ? SAVEDSTATEVERSION : SAVEDSTATEVERSIONWITHMODULES;
         saveHeader.segmentDescrLength = sizeof(SavedStateSegmentDescr);
         if (newHierarchy == 1)
             saveHeader.parentTimeStamp = exportSignature;
@@ -868,6 +936,8 @@ void SaveRequest::Perform()
         }
 
         // Write out the relocations and the data.
+        double relocWall = 0, relocCpu = 0, dataWall = 0, dataCpu = 0;
+        uint64_t relocTotal = 0;
         for (unsigned k = 1 /* Not IO area */; k < memTableEntries; k++)
         {
             ExportMemTable* entry = &memTable[k];
@@ -876,24 +946,30 @@ void SaveRequest::Perform()
             if (k >= permanentEntries ||
                 (entry->mtFlags & (MTF_WRITEABLE | MTF_NO_OVERWRITE)) == MTF_WRITEABLE)
             {
-                descrs[k].relocations = ftell(exportFile);
-                // Have to write this out.
-                relocationCount = 0;
-                // Create the relocation table.
                 char* start = (char*)entry->mtOriginalAddr;
                 char* end = start + entry->mtLength;
-                for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+                // Have to write this out.
+                relocationCount = 0;
+                // Create the relocation table, except where the loader scans the objects.
+                descrs[k].relocations = 0;
+                if (!scanned || (entry->mtFlags & MTF_EXECUTABLE) || containsCode((PolyWord*)start, (PolyWord*)end))
                 {
-                    p++;
-                    PolyObject* obj = (PolyObject*)p;
-                    POLYUNSIGNED length = obj->Length();
-                    // Now include all relocations rather than trying to sort them out when loading.
-                    if (length != 0 && obj->IsCodeObject())
-                        machineDependent->ScanConstantsWithinCode(obj, this);
-                    relocateObject(obj);
-                    p += length;
+                    descrs[k].relocations = ftell(exportFile);
+                    for (PolyWord* p = (PolyWord*)start; p < (PolyWord*)end; )
+                    {
+                        p++;
+                        PolyObject* obj = (PolyObject*)p;
+                        POLYUNSIGNED length = obj->Length();
+                        // Now include all relocations rather than trying to sort them out when loading.
+                        if (length != 0 && obj->IsCodeObject())
+                            machineDependent->ScanConstantsWithinCode(obj, this);
+                        relocateObject(obj);
+                        p += length;
+                    }
                 }
                 descrs[k].relocationCount = relocationCount;
+                relocTotal += relocationCount;
+                clock.AddTo(relocWall, relocCpu);
                 // Write out the data, starting at a multiple of 64K so that it can be mapped.
                 static const char zeros[4096] = { 0 };
                 for (off_t pos = ftell(exportFile); pos % (64 * 1024) != 0; )
@@ -907,8 +983,14 @@ void SaveRequest::Perform()
                 descrs[k].segmentData = ftell(exportFile);
                 if (!checkedFwrite(entry->mtOriginalAddr, entry->mtLength, 1))
                     return;
+                clock.AddTo(dataWall, dataCpu);
             }
         }
+        LogPhase("save-relocs", relocWall, relocCpu);
+        LogPhase("save-data", dataWall, dataCpu);
+        if (debugOptions & DEBUG_SAVETIME)
+            Log("SAVETIME: save-relocations count=%llu bytes=%llu\n",
+                (unsigned long long)relocTotal, (unsigned long long)(relocTotal * sizeof(RelocationEntry)));
 
         // If this is a child we need to write a string table containing the parent name.
         if (newHierarchy > 1)
@@ -951,6 +1033,7 @@ void SaveRequest::Perform()
         if (!checkedFwrite(descrs.data(), sizeof(SavedStateSegmentDescr), memTableEntries))
             return;
 
+        clock.Lap("save-tables");
         if (debugOptions & DEBUG_SAVING)
             Log("SAVE: Writing complete.\n");
 
@@ -988,10 +1071,13 @@ static POLYUNSIGNED saveState(POLYUNSIGNED threadId, POLYUNSIGNED fileName, POLY
         // Request a full GC first.  The main reason is to avoid running out of memory as a
         // result of repeated saves.  Old export spaces are turned into local spaces and
         // the GC will delete them if they are completely empty
+        PhaseClock clock;
         FullGC(taskData);
+        clock.Lap("save-fullgc");
 
         SaveRequest request(fileNameBuff, newHierarchy, withModules);
         processes->MakeRootRequest(taskData, &request);
+        clock.Lap("save-request");
         if (request.errorMessage)
             raise_syscall(taskData, request.errorMessage, request.errNumber);
     }
@@ -1135,6 +1221,57 @@ size_t readData(void *ptr, size_t size, FILE *stream)
 static bool loadModuleFile(const std_tstring& fileName, const ModuleId* requiredId,
     const char*& errorResult, int& errNumber, PolyObject*& root, ModuleId& loadedId);
 
+// The number of saved state and module files loaded so far that had segments not where
+// they were saved, so that relocations were read.
+static unsigned movedStateLoads = 0, movedModuleLoads = 0;
+
+// Relocate a segment saved without a relocation table: add to each address in its objects
+// how far the segment it points into has moved.  byAddress lists the segments, by index,
+// in the order of their original addresses.  Returns an error message or 0.
+static const char *relocateByScanning(PolyWord *base, size_t segmentSize, const std::vector<SavedStateSegmentDescr> &descrs,
+    const std::vector<std::pair<uintptr_t, size_t> > &byAddress,
+    const std::vector<StateLoadData> &loadData, const std::vector<bool> &moved, uint64_t &relocsApplied)
+{
+    PolyWord *end = base + segmentSize / sizeof(PolyWord);
+    for (PolyWord *p = base; p < end; )
+    {
+        p++;
+        PolyObject *obj = (PolyObject*)p;
+        POLYUNSIGNED length = obj->Length();
+        if (length > (POLYUNSIGNED)(end - p))
+            return "Object in saved state runs past its segment";
+        if (obj->IsCodeObject())
+            return "Code in a saved state segment without relocations";
+        if (!obj->IsByteObject())
+        {
+            for (POLYUNSIGNED i = 0; i < length; i++)
+            {
+                PolyWord w = p[i];
+                if (w.IsTagged() || w == PolyWord::FromUnsigned(0))
+                    continue;
+                // The last segment that starts below the address.  An address can be the end
+                // of a segment if a zero-length object is last in it.
+                uintptr_t a = w.AsUnsigned();
+                std::vector<std::pair<uintptr_t, size_t> >::const_iterator s =
+                    std::lower_bound(byAddress.begin(), byAddress.end(), std::make_pair(a, (size_t)0));
+                if (s == byAddress.begin())
+                    return "Address in saved state is outside its segments";
+                s--;
+                size_t t = s->second;
+                if (a > s->first + descrs[t].segmentSize)
+                    return "Address in saved state is outside its segments";
+                if (moved[t])
+                {
+                    p[i] = PolyWord::FromUnsigned(a - s->first + (uintptr_t)loadData[t].targetAddr);
+                    relocsApplied++;
+                }
+            }
+        }
+        p += length;
+    }
+    return 0;
+}
+
 // Load a saved state file.  Calls itself to handle parent files.
 bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail)
 {
@@ -1254,6 +1391,7 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
     // Load the modules this state depends on that aren't already loaded.  This is done
     // after the parents are loaded because loading the top-level state unloads all modules,
     // and before this state's segments because they may overwrite or refer to the modules' spaces.
+    PhaseClock clock;
     std::vector<ModuleTableItem> moduleTable;
     errorResult = readModuleTable(loadFile, &fullHeader, moduleTable);
     if (errorResult != NULL)
@@ -1287,6 +1425,8 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
             return false;
         }
     }
+
+    clock.Lap("load-modules");
 
     // Now have a valid, matching saved state.
     // Load the segment descriptors.
@@ -1361,7 +1501,9 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
 #endif
             if (newSpace == 0)
             {
-                newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, descr->moduleId);
+                // Code goes where it was when saved if that is free.
+                newSpace = gMem.AllocateNewPermanentSpace(descr->segmentSize, mFlags, descr->segmentIndex, descr->moduleId,
+                    descr->segmentFlags & SSF_CODE ? descr->originalAddr : 0);
                 if (newSpace == 0)
                 {
                     errorResult = "Unable to allocate memory";
@@ -1386,15 +1528,12 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
                 // Leave it writable until we've done the relocations.
             }
 
-            if (newSpace->noOverwrite)
-            {
-                ClearVolatile cwbr;
-                cwbr.ScanAddressesInRegion(newSpace->bottom, newSpace->topPointer);
-            }
             load.targetAddr = newSpace->bottom;
         }
         loadData.push_back(load);
     }
+
+    clock.Lap("load-segments");
 
     // Now read in the mutable overwrites.  This overwrites the muable areas with the values from the saved state.
     for (std::vector<SavedStateSegmentDescr>::iterator descr = descrs.begin(); descr < descrs.end(); descr++)
@@ -1416,15 +1555,37 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
         }
     }
 
+    clock.Lap("load-overwrite");
+
     // Now the relocations.  The saved data holds the values it had when saved, so an
     // entry needs applying only if the segment it is in or the one it points into is
     // no longer where it was then.
     std::vector<bool> moved(descrs.size());
     bool anyMoved = false;
+    size_t movedCount = 0, ownCount = 0, ownMoved = 0, ownCodeMoved = 0;
+    uint64_t relocsRead = 0, relocsApplied = 0;
     for (size_t j = 0; j < descrs.size(); j++)
     {
         moved[j] = (void*)loadData[j].targetAddr != descrs[j].originalAddr;
         anyMoved = anyMoved || moved[j];
+        if (moved[j]) movedCount++;
+        // Segments this file creates, not ones in a parent or the executable whose
+        // contents it overwrites.
+        if (descrs[j].segmentData != 0 && (descrs[j].segmentFlags & SSF_OVERWRITE) == 0)
+        {
+            ownCount++;
+            if (moved[j]) ownMoved++;
+            if (moved[j] && (descrs[j].segmentFlags & SSF_CODE)) ownCodeMoved++;
+        }
+    }
+    // The segments by their original address, for relocating segments without relocations.
+    std::vector<std::pair<uintptr_t, size_t> > byAddress;
+    if (anyMoved)
+    {
+        for (size_t j = 0; j < descrs.size(); j++)
+            if (descrs[j].segmentSize != 0)
+                byAddress.push_back(std::make_pair((uintptr_t)descrs[j].originalAddr, j));
+        std::sort(byAddress.begin(), byAddress.end());
     }
     std::vector<RelocationEntry> relocBuffer(anyMoved ? 4096 : 0);
     for (size_t j = 0; j < loadData.size(); j++)
@@ -1457,11 +1618,47 @@ bool StateLoader::LoadFile(bool isInitial, ModuleId requiredStamp, PolyWord tail
                     byte *setAddress = (byte*)baseAddr + reloc.relocAddress;
                     byte *targetAddress = (byte*)loadData[reloc.targetSegment].targetAddr + reloc.targetAddress;
                     ScanAddress::SetConstantValue(setAddress, (PolyObject*)(targetAddress), reloc.relKind);
+                    relocsApplied++;
                 }
+                relocsRead += n;
                 k += (unsigned)n;
             }
         }
+        else if (anyMoved && descrs[j].segmentData != 0 && (descrs[j].segmentFlags & (SSF_BYTES | SSF_CODE)) == 0)
+        {
+            const char *error = relocateByScanning(baseAddr, descrs[j].segmentSize, descrs, byAddress, loadData, moved, relocsApplied);
+            if (error != 0)
+            {
+                errorResult = error;
+                return false;
+            }
+        }
     }
+
+    // Set external references and clear weak refs now that the relocations can't overwrite them.
+    for (size_t j = 0; j < descrs.size(); j++)
+    {
+        if (descrs[j].segmentData != 0 && (descrs[j].segmentFlags & (SSF_OVERWRITE | SSF_NOOVERWRITE)) == SSF_NOOVERWRITE)
+        {
+            ClearVolatile cwbr;
+            cwbr.ScanAddressesInRegion(loadData[j].targetAddr, loadData[j].targetAddr + descrs[j].segmentSize / sizeof(PolyWord));
+        }
+    }
+
+    clock.Lap("load-relocs");
+    if (anyMoved)
+        movedStateLoads++;
+    if (debugOptions & (DEBUG_SAVING | DEBUG_SAVETIME))
+        Log(
+#if (defined(_WIN32) && defined(UNICODE))
+            "LOAD: %S: "
+#else
+            "LOAD: %s: "
+#endif
+            "%zu of %zu segments moved (%zu of the %zu this file creates, %zu of them code), %llu relocations read, %llu applied; "
+            "loads with moved segments: %u states, %u modules\n",
+            (TCHAR*)thisFile, movedCount, descrs.size(), ownMoved, ownCount, ownCodeMoved, (unsigned long long)relocsRead,
+            (unsigned long long)relocsApplied, movedStateLoads, movedModuleLoads);
 
     // Add an entry to the hierarchy table for this file.
     HierarchyTable level(thisFile, header.timeStamp);
@@ -2114,13 +2311,16 @@ void ModuleExporter::RunModuleExport(PolyObject* rootFn)
         }
     }
 
+    PhaseClock clock;
     try {
         copyScan.initialise();
         // Copy the root and everything reachable from it into the temporary area.
         copiedRoot = copyScan.ScanObjectAddress(rootFn);
+        clock.Lap("module-scan");
         // Fix the permanent areas.  We may have copied cells from modules if they are
         // not dependencies.
         CopyScan::fixPermanentAreas();
+        clock.Lap("module-fixperm");
     }
     catch (MemoryException&)
     {
@@ -2960,6 +3160,8 @@ static bool loadModuleFile(const std_tstring& fileName, const ModuleId* required
         bool anyMoved = false;
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); i < loadData.end(); i++)
             anyMoved = anyMoved || i->moved;
+        if (anyMoved)
+            movedModuleLoads++;
         for (std::vector<ModuleLoadData>::iterator i = loadData.begin(); anyMoved && i < loadData.end(); i++)
         {
             PolyWord* baseAddr = i->targetAddr;

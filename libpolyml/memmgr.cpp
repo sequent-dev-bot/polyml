@@ -63,6 +63,11 @@ static const uintptr_t stateRegionBase = (uintptr_t)0x200000000000;
 static const uintptr_t stateRegionTop = (uintptr_t)0x300000000000;
 static const uintptr_t stateRegionAlign = 64 * 1024;
 #endif
+#ifdef POLYML_PLACE_SAVED_CODE
+// Where the 2G code area is reserved if that address is free: away from the state
+// region and below where mmap(0, ...) and PIE images go on x86-64 and Arm64 Linux.
+static void * const codeAreaPreferredBase = (void*)0x6eff00000000;
+#endif
 
 
 #ifdef POLYML32IN64
@@ -194,9 +199,17 @@ bool MemMgr::Initialise()
 #if (defined(POLYML32IN64) || defined(HOSTARCHITECTURE_X86_64) || defined(HOSTARCHITECTURE_AARCH64))
     // Reserve a 2G area for the code.  N.B. If we need to use a shadow area this size may be reduced.
     void* codeBase;
+    void* preferredCodeBase = 0;
+#ifdef POLYML_PLACE_SAVED_CODE
+    preferredCodeBase = codeAreaPreferredBase;
+#endif
     if (!osCodeAlloc.Initialise(executableCodeWhereNecessary,
-        (size_t)2 * 1024 * 1024 * 1024, &codeBase))
+        (size_t)2 * 1024 * 1024 * 1024, &codeBase, preferredCodeBase))
         return false;
+#ifdef POLYML_PLACE_SAVED_CODE
+    codeAreaBase = (char*)codeBase;
+    savedCodeFloor = 0;
+#endif
 #ifdef POLYML32IN64
     globalCodeBase = (PolyWord*)codeBase;
 #endif
@@ -360,7 +373,8 @@ PermanentMemSpace* MemMgr::PermanentSpaceFromExecutable(PolyWord *base, uintptr_
     }
 }
 
-PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule)
+PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigned flags, unsigned index, ModuleId sourceModule,
+    void *codeAddr)
 {
     try {
         OSMem *alloc = flags & MTF_EXECUTABLE ? (OSMem*)&osCodeAlloc : (OSMem*)&osHeapAlloc;
@@ -369,7 +383,15 @@ PermanentMemSpace *MemMgr::AllocateNewPermanentSpace(uintptr_t byteSize, unsigne
         PolyWord* base;
         void* newShadow=0;
         if (flags & MTF_EXECUTABLE)
-            base = (PolyWord*)alloc->AllocateCodeArea(actualSize, newShadow);
+        {
+            base = 0;
+#ifdef POLYML_PLACE_SAVED_CODE
+            if (codeAddr != 0)
+                base = (PolyWord*)osCodeAlloc.AllocateCodeAreaAbove(actualSize, newShadow, codeAddr);
+            if (base == 0)
+#endif
+                base = (PolyWord*)alloc->AllocateCodeArea(actualSize, newShadow);
+        }
         else base = (PolyWord*)alloc->AllocateDataArea(actualSize);
         if (base == 0)
         {
@@ -496,6 +518,16 @@ void *MemMgr::AllocateInStateRegion(size_t &space)
 }
 #endif
 
+#ifdef POLYML_PLACE_SAVED_CODE
+// Code saved at depth d goes at the lowest free address at or above (d-1)*64M in the
+// code area, so a child's code doesn't collide with its parents' and is placed the same
+// whichever process saves it.  Transient code is allocated from the top down.
+void MemMgr::SetSavedCodeDepth(unsigned depth)
+{
+    savedCodeFloor = depth == 0 ? 0 : codeAreaBase + (size_t)(depth - 1) * 64 * 1024 * 1024;
+}
+#endif
+
 // Called to set the permissions on permanent spaces from the executable.
 bool MemMgr::CompletePermanentSpaceAllocation(PermanentMemSpace *space)
 {
@@ -553,7 +585,13 @@ PermanentMemSpace* MemMgr::NewExportSpace(uintptr_t size, bool mut, bool noOv, b
         if (code)
         {
             void* shadow;
-            space->bottom = (PolyWord*)alloc->AllocateCodeArea(iSpace, shadow);
+            space->bottom = 0;
+#ifdef POLYML_PLACE_SAVED_CODE
+            if (savedCodeFloor != 0)
+                space->bottom = (PolyWord*)osCodeAlloc.AllocateCodeAreaAbove(iSpace, shadow, savedCodeFloor);
+            if (space->bottom == 0)
+#endif
+                space->bottom = (PolyWord*)alloc->AllocateCodeArea(iSpace, shadow);
             if (space->bottom != 0)
                 space->shadowSpace = (PolyWord*)shadow;
         }
@@ -1536,7 +1574,7 @@ void MemMgr::RemoveTreeRange(SpaceTree **tt, MemSpace *space, uintptr_t startS, 
 void MemMgr::ReplaceTree(MemSpace *oldS, MemSpace *newS)
 {
     PLocker lock(&spaceTreeLock);
-    ReplaceTreeRange(&spaceTree, oldS, newS, (uintptr_t)oldS->bottom, (uintptr_t)oldS->top);
+    ReplaceTreeRange(&spaceTree, oldS, newS, (uintptr_t)TreeBottom(oldS), (uintptr_t)TreeTop(oldS));
 }
 
 void MemMgr::ReplaceTreeRange(SpaceTree **tt, MemSpace *oldS, MemSpace *newS, uintptr_t startS, uintptr_t endS)

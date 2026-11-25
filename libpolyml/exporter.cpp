@@ -170,7 +170,9 @@ void CopyScan::initialise()
     for (std::vector<PermanentMemSpace*>::iterator i = gMem.pSpaces.begin(); i < gMem.pSpaces.end(); i++)
     {
         PermanentMemSpace *space = *i;
-        if (! dependencies[space->moduleIdentifier]) {
+        space->isExportDependency = dependencies[space->moduleIdentifier];
+        space->hasForwarded = false;
+        if (! space->isExportDependency) {
             // Include this if we're exporting (hierarchy=0) or if we're saving a state
             // and will include this in the new state.
             size_t size = (space->top-space->bottom)/4;
@@ -320,7 +322,7 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
     if (space->spaceType == ST_PERMANENT)
     {
         PermanentMemSpace *pmSpace = (PermanentMemSpace*)space;
-        if (dependencies[pmSpace->moduleIdentifier])
+        if (pmSpace->isExportDependency)
             return 0;
     }
 
@@ -430,6 +432,9 @@ POLYUNSIGNED CopyScan::ScanAddress(PolyObject **pt)
         else memcpy(writAble, obj, words * sizeof(PolyWord));
     }
 
+    // An object in any other permanent space is forwarded in place, below: fixPermanentAreas reverts that.
+    if (space->spaceType == ST_PERMANENT && !((PermanentMemSpace*)space)->isWriteProtected)
+        ((PermanentMemSpace*)space)->hasForwarded = true;
     if (space->spaceType == ST_PERMANENT && ((PermanentMemSpace*)space)->isWriteProtected)
     {
         // The immutable permanent areas are read-only.
@@ -1144,10 +1149,11 @@ void CopyScan::fixPermanentAreas()
     {
         PermanentMemSpace* space = *i;
         // Objects in write-protected areas are never forwarded: their tombstones are in the graveyard.
-        if (space->isWriteProtected)
+        if (space->isWriteProtected || !space->hasForwarded)
             continue;
         // Permanent areas are filled with objects from the bottom.
         FixForwarding(space->bottom, space->top - space->bottom);
+        space->hasForwarded = false;
     }
 }
 

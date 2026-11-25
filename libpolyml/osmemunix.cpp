@@ -198,7 +198,7 @@ bool OSMem::Initialise(enum _MemUsage usage)
     return true;
 }
 
-bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space /* = 0 */, void** pBase /* = 0 */)
+bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space, void** pBase, void* preferredBase)
 {
     if (!OSMem::Initialise(usage))
         return false;
@@ -216,7 +216,23 @@ bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space /* = 0 */, voi
             memBase = (char*)mmap(0, space, PROT_READ|PROT_WRITE|PROT_EXEC, flags | MAP_JIT, -1, 0);
         else
 #endif
-        memBase = (char*)mmap(0, space, PROT_NONE, flags, -1, 0);
+        {
+            memBase = (char*)MAP_FAILED;
+#ifdef MAP_FIXED_NOREPLACE
+            if (preferredBase != 0)
+            {
+                memBase = (char*)mmap(preferredBase, space, PROT_NONE, flags | MAP_FIXED_NOREPLACE, -1, 0);
+                // Kernels before 4.17 ignore the flag and may put it elsewhere.
+                if (memBase != MAP_FAILED && memBase != preferredBase)
+                {
+                    munmap(FIXTYPE memBase, space);
+                    memBase = (char*)MAP_FAILED;
+                }
+            }
+#endif
+            if (memBase == MAP_FAILED)
+                memBase = (char*)mmap(0, space, PROT_NONE, flags, -1, 0);
+        }
         if (memBase == MAP_FAILED) return false;
         // We need the heap to be such that the top 32-bits are non-zero.
         if ((uintptr_t)memBase < ((uintptr_t)1 << 32))
@@ -259,6 +275,7 @@ bool OSMemInRegion::Initialise(enum _MemUsage usage, size_t space /* = 0 */, voi
     // Create a bitmap with a bit for each page.
     if (!pageMap.Create(space / pageSize))
         return false;
+    regionPages = space / pageSize;
     lastAllocated = space / pageSize; // Beyond the last page in the area
     // Set the last bit in the area so that we don't use it.
     // This is effectively a work-around for a problem with the heap.
@@ -278,7 +295,7 @@ void* OSMemInRegion::AllocateDataArea(size_t& space)
         // Round up to an integral number of pages.
         space = pages * pageSize;
         // Find some space
-        while (pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
+        while (lastAllocated > 0 && pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
             lastAllocated--;
         uintptr_t free = pageMap.FindFree(0, lastAllocated, pages);
         if (free == lastAllocated)
@@ -327,7 +344,7 @@ void* OSMemInRegion::AllocateCodeArea(size_t& space, void*& shadowArea)
         // Round up to an integral number of pages.
         space = pages * pageSize;
         // Find some space
-        while (pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
+        while (lastAllocated > 0 && pageMap.TestBit(lastAllocated - 1)) // Skip the wholly allocated area.
             lastAllocated--;
         uintptr_t free = pageMap.FindFree(0, lastAllocated, pages);
         if (free == lastAllocated)
@@ -335,7 +352,45 @@ void* OSMemInRegion::AllocateCodeArea(size_t& space, void*& shadowArea)
         pageMap.SetBits(free, pages);
         offset = free * pageSize;
     }
-    
+    return MapCodeArea(offset, space, shadowArea);
+}
+
+void* OSMemInRegion::AllocateCodeAreaAbove(size_t& space, void*& shadowArea, void* low)
+{
+    if ((char*)low < memBase)
+        return 0;
+    uintptr_t offset;
+    {
+        PLocker l(&bitmapLock);
+        uintptr_t pages = (space + pageSize - 1) / pageSize;
+        space = pages * pageSize;
+        uintptr_t align = 64 * 1024 > pageSize ? 64 * 1024 / pageSize : 1;
+        uintptr_t candidate = ((char*)low - memBase + align * pageSize - 1) / pageSize / align * align;
+        while (true)
+        {
+            if (candidate + pages > regionPages)
+                return 0;
+            uintptr_t free = pageMap.CountZeroBits(candidate, pages);
+            if (free >= pages)
+                break;
+            candidate = (candidate + free + align) / align * align; // Past the used page.
+        }
+        pageMap.SetBits(candidate, pages);
+        offset = candidate * pageSize;
+    }
+    void* result = MapCodeArea(offset, space, shadowArea);
+    if (result == 0)
+    {
+        // The caller falls back to AllocateCodeArea: don't leave these pages marked.
+        PLocker l(&bitmapLock);
+        pageMap.ClearBits(offset / pageSize, space / pageSize);
+    }
+    return result;
+}
+
+// Make the pages at offset, already marked as allocated, usable for code.
+void* OSMemInRegion::MapCodeArea(uintptr_t offset, size_t space, void*& shadowArea)
+{
     if (wxFix != WXFixDualArea)
     {
         char *baseAddr = memBase + offset;
