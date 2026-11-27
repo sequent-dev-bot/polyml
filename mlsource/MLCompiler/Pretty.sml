@@ -71,9 +71,9 @@ struct
         
         val tagPrettyBlock = 0w0
         and tagPrettyBreak = 0w1
-        (*and tagPrettyLineBreak = 0w2*)        (* Not used in the compiler. *)
+        and tagPrettyLineBreak = 0w2        (* Not built by the compiler. *)
         and tagPrettyString = 0w3
-        (*and tagPrettyStringWithWidth = 0w4*)   (* Not used in the compiler. *)
+        and tagPrettyStringWithWidth = 0w4  (* Not built by the compiler. *)
         
         val maxPrettyTag = 0w4 (* Exported because it is used in TagTest. *)
 
@@ -85,6 +85,8 @@ struct
         fun isPrettyBlock p = toShort(loadWord(p, 0w0)) = tagPrettyBlock
         and isPrettyBreak p = toShort(loadWord(p, 0w0)) = tagPrettyBreak
         and isPrettyString p = toShort(loadWord(p, 0w0)) = tagPrettyString
+        and isPrettyLineBreak p = toShort(loadWord(p, 0w0)) = tagPrettyLineBreak
+        and isPrettyStringWithWidth p = toShort(loadWord(p, 0w0)) = tagPrettyStringWithWidth
 
         fun projPrettyBlock p =
             if isPrettyBlock p
@@ -116,11 +118,25 @@ struct
                 s
             end
             else raise Match
+
+        and projPrettyStringWithWidth p =
+            if isPrettyStringWithWidth p
+            then
+            let
+                val (_: int, s: string, _: int) = RunCall.unsafeCast p
+            in
+                s
+            end
+            else raise Match
     end
 
+    (* Values printed by user-installed pretty printers reach here through
+       makestring and exnMessage, so all five constructors must be handled. *)
     fun uglyPrint p =
         if isPrettyBlock p then String.concat(map uglyPrint(#4 (projPrettyBlock p)))
         else if isPrettyBreak p then String.implode(List.tabulate(#1 (projPrettyBreak p), fn _ => #" "))
+        else if isPrettyLineBreak p then "\n"
+        else if isPrettyStringWithWidth p then projPrettyStringWithWidth p
         else projPrettyString p
 
     (* Pretty printer copied directly from basis/PrettyPrinter.  We can't use the
